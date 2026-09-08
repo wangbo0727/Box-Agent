@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 from acp_eval import SCHEMA_VERSION
 from acp_eval.case_runner import CaseConfig, run_case
 from acp_eval.ids import new_run_id
-from acp_eval.models import RunResult
+from acp_eval.models import CaseMetadata, RunResult
 from acp_eval.storage import atomic_write_json, sha256_file
 
 
@@ -279,6 +279,7 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
         query = value.get("query")
         if not isinstance(query, str) or not query:
             raise ValueError(f"case {case_id} query must be a non-empty string")
+        CaseMetadata.from_record(value)
         normalized = dict(value)
         normalized["input_files"] = _validate_input_files(
             path.parent,

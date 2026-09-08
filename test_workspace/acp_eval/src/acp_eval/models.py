@@ -1,7 +1,49 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from acp_eval import SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class CaseMetadata:
+    """Explicit ACP controls supported by offline cases; identity stays runner-owned."""
+
+    session: Mapping[str, Any] = field(default_factory=dict)
+    prompt: Mapping[str, Any] = field(default_factory=dict)
+    allowed_directories: tuple[str, ...] = ()
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "CaseMetadata":
+        def metadata(name: str, allowed: set[str]) -> dict[str, Any]:
+            value = record.get(name, {})
+            if not isinstance(value, dict) or set(value) - allowed:
+                raise ValueError(f"case metadata: unsupported {name} fields or type")
+            return dict(value)
+
+        def boolean(values: Mapping[str, Any], key: str) -> None:
+            if key in values and not isinstance(values[key], bool):
+                raise ValueError(f"case metadata: {key} must be a boolean")
+
+        session = metadata("session_meta", {"deep_think"})
+        prompt = metadata("prompt_meta", {"auto_approve_plan", "selected_skill_names"})
+        boolean(session, "deep_think")
+        boolean(prompt, "auto_approve_plan")
+        if "selected_skill_names" in prompt:
+            names = prompt["selected_skill_names"]
+            if not isinstance(names, list) or not all(
+                isinstance(name, str) and name.strip() and "\x00" not in name
+                for name in names
+            ):
+                raise ValueError("case metadata: selected_skill_names must be a string list")
+            prompt["selected_skill_names"] = list(names)
+        directories = record.get("session_allowed_directories", [])
+        if not isinstance(directories, list) or not all(
+            isinstance(path, str) and "\x00" not in path and Path(path).is_absolute()
+            for path in directories
+        ):
+            raise ValueError("case metadata: session_allowed_directories must be absolute paths")
+        return cls(session=session, prompt=prompt, allowed_directories=tuple(directories))
 
 
 @dataclass(frozen=True)

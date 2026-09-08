@@ -60,6 +60,31 @@ list. Input paths are relative to the dataset directory and must resolve to
 regular files inside it. The runner validates the complete dataset and exact
 case selection before creating a run directory.
 
+Each staged input is included in `session/prompt` as a standard ACP
+`resource_link` with its session-local URI, original filename, MIME type and byte
+size. A separate text block lists the same session-local attachment paths for
+older ACP implementations that only consume text blocks. The first text block
+retains the original query verbatim. Attachment bytes are unchanged, their
+hashes remain in the input snapshot, and staging does not add external allowed
+directories. Cases without input files retain their single query text block.
+
+Cases may explicitly provide these ACP metadata fields:
+
+- `session_meta.deep_think`: a boolean forwarded to `session/new` metadata.
+- `prompt_meta.auto_approve_plan`: a boolean forwarded to `session/prompt` metadata.
+- `prompt_meta.selected_skill_names`: a list of non-empty skill-name strings.
+- `session_allowed_directories`: a list of absolute paths added to the session's
+  existing `filesystem_policy.allowed_directories`.
+
+For example, `"session_meta": {"deep_think": true}` requests the host's existing
+thinking mode without changing the case query. Unsupported metadata keys and
+incorrect types are rejected before execution. The original record, including
+metadata, remains in `input.json` and participates in the case fingerprint.
+Omitting these fields preserves the default thinking mode, filesystem policy,
+and client capabilities. The runner retains its own session/turn IDs, workspace
+layout, and default permission mode; permission requests are still cancelled.
+Plan approval metadata does not approve tool permission requests.
+
 ## v1 evidence layout
 
 ```text

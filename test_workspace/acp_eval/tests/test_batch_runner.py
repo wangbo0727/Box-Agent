@@ -38,6 +38,39 @@ def record(case_id: str, input_files: list[str] | None = None) -> dict[str, Any]
     }
 
 
+@pytest.mark.parametrize("metadata", [
+    {"session_meta": {"deep_think": "true"}},
+    {"session_meta": {"deep_think": 1}},
+    {"session_meta": {"permission_mode": "bypass"}},
+    {"session_meta": {"session_id": "override"}},
+    {"session_meta": None},
+    {"prompt_meta": {"selected_skill_names": "sn-ppt-web"}},
+    {"prompt_meta": {"selected_skill_names": [1]}},
+    {"prompt_meta": {"auto_approve_plan": "true"}},
+    {"prompt_meta": {"turnId": "override"}},
+    {"session_allowed_directories": "reference"},
+    {"session_allowed_directories": ["relative/path"]},
+    {"session_allowed_directories": ["/tmp/invalid\x00path"]},
+])
+def test_dataset_rejects_invalid_or_unsupported_case_metadata(
+    tmp_path: Path, metadata: dict[str, Any]
+) -> None:
+    dataset = write_dataset(tmp_path, [{**record("metadata"), **metadata}])
+    with pytest.raises(ValueError, match="case metadata"):
+        load_dataset(dataset)
+
+
+def test_dataset_preserves_explicit_false_and_metadata_record(tmp_path: Path) -> None:
+    value = {
+        **record("metadata"),
+        "session_meta": {"deep_think": False},
+        "prompt_meta": {"auto_approve_plan": False, "selected_skill_names": []},
+        "session_allowed_directories": [],
+    }
+    dataset = write_dataset(tmp_path, [value])
+    assert load_dataset(dataset) == [value]
+
+
 def make_fake_repo(root: Path, mode: str = "normal") -> Path:
     package = root / "box_agent" / "acp"
     package.mkdir(parents=True)

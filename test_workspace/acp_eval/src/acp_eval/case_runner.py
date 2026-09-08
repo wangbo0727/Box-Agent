@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import signal
 import shutil
@@ -16,7 +17,7 @@ from typing import Any, Callable, Mapping, Sequence
 from acp_eval import SCHEMA_VERSION
 from acp_eval.ids import new_attempt_id
 from acp_eval.lifecycle import ProcessRecorder, drain_stream, stop_process
-from acp_eval.models import AttemptManifest, RunResult
+from acp_eval.models import AttemptManifest, CaseMetadata, RunResult
 from acp_eval.protocol import ACPAccumulator, ProtocolRecorder
 from acp_eval.snapshots import build_artifact_inventory, write_snapshot
 from acp_eval.stderr_scan import scan_stderr, summarize_stderr
@@ -141,9 +142,10 @@ def _input_paths(record: Mapping[str, Any]) -> Sequence[str]:
     return value
 
 
-def _copy_inputs(dataset_root: Path, workspace: Path, paths: Sequence[str]) -> None:
+def _copy_inputs(dataset_root: Path, workspace: Path, paths: Sequence[str]) -> list[Path]:
     root = dataset_root.resolve()
     destination_names: set[str] = set()
+    staged: list[Path] = []
     for relative_path in paths:
         if not relative_path or "\x00" in relative_path:
             raise ValueError(f"invalid input path: {relative_path!r}")
@@ -157,7 +159,9 @@ def _copy_inputs(dataset_root: Path, workspace: Path, paths: Sequence[str]) -> N
         if source.name in destination_names:
             raise ValueError(f"duplicate input basename: {source.name}")
         shutil.copy2(source, workspace / source.name)
+        staged.append(workspace / source.name)
         destination_names.add(source.name)
+    return staged
 
 
 def _new_attempt_dir(case_dir: Path) -> tuple[str, Path]:
@@ -174,8 +178,11 @@ def _new_attempt_dir(case_dir: Path) -> tuple[str, Path]:
     raise RuntimeError("could not allocate a unique attempt id")
 
 
-def _session_params(workspace: Path, case_id: str) -> dict[str, Any]:
+def _session_params(
+    workspace: Path, case_id: str, metadata: CaseMetadata | None = None,
+) -> dict[str, Any]:
     workspace = workspace.resolve()
+    metadata = metadata or CaseMetadata()
     return {
         "cwd": str(workspace),
         "mcpServers": [],
@@ -185,21 +192,52 @@ def _session_params(workspace: Path, case_id: str) -> dict[str, Any]:
             "permission_mode": "default",
             "filesystem_policy": {
                 "session_workspace_root": str(workspace),
-                "allowed_directories": [],
+                "allowed_directories": list(metadata.allowed_directories),
                 "filesystem_scope": "session_workspace",
             },
             "workspace_layout": {
                 "artifact_root_dir": str(workspace / "output"),
             },
+            **metadata.session,
         },
     }
 
 
-def _prompt_params(session_id: str, query: str, case_id: str) -> dict[str, Any]:
+def _prompt_params(
+    session_id: str, query: str, case_id: str, metadata: CaseMetadata | None = None,
+    input_files: Sequence[Path] = (),
+) -> dict[str, Any]:
+    metadata = metadata or CaseMetadata()
+    prompt: list[dict[str, Any]] = [{"type": "text", "text": query}]
+    attachments: list[dict[str, str]] = []
+    for source in input_files:
+        source = source.resolve()
+        prompt.append({
+            "type": "resource_link",
+            "name": source.name,
+            "uri": source.as_uri(),
+            "mimeType": (
+                "text/markdown" if source.suffix.lower() in {".md", ".markdown"}
+                else mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+            ),
+            "size": source.stat().st_size,
+        })
+        attachments.append({"name": source.name, "path": str(source)})
+    if attachments:
+        # Older Box-Agent ACP versions join text blocks without expanding
+        # resource links. Keep a separate path index visible to those versions
+        # while preserving the original query and standard resource links.
+        prompt.append({
+            "type": "text",
+            "text": "Attached input files (copied into this session workspace):\n"
+            + json.dumps(attachments, ensure_ascii=False),
+        })
     return {
         "sessionId": session_id,
-        "prompt": [{"type": "text", "text": query}],
-        "_meta": {"title": "acp", "turnId": f"eval-acp-{case_id}-turn-1"},
+        "prompt": prompt,
+        "_meta": {
+            "title": "acp", "turnId": f"eval-acp-{case_id}-turn-1", **metadata.prompt,
+        },
     }
 
 
@@ -316,9 +354,11 @@ async def _exchange(
     case_id: str,
     query: str,
     timeout_seconds: float,
+    metadata: CaseMetadata | None = None,
+    input_files: Sequence[Path] = (),
 ) -> None:
     deadline = monotonic() + timeout_seconds
-    session_params = _session_params(workspace, case_id)
+    session_params = _session_params(workspace, case_id, metadata)
     session_meta = session_params.get("_meta")
     upstream_session_id = (
         session_meta.get("session_id")
@@ -387,7 +427,7 @@ async def _exchange(
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
-            "params": _prompt_params(acp_session_id, query, case_id),
+            "params": _prompt_params(acp_session_id, query, case_id, metadata, input_files),
         },
     )
     response = await _read_until_response(
@@ -480,6 +520,8 @@ async def _run_process(
     accumulator: ACPAccumulator,
     process_recorder: ProcessRecorder,
     state: _AttemptState,
+    metadata: CaseMetadata | None = None,
+    input_files: Sequence[Path] = (),
 ) -> None:
     process: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
@@ -520,6 +562,8 @@ async def _run_process(
                 case_id,
                 query,
                 config.timeout_seconds,
+                metadata,
+                input_files,
             )
         except asyncio.TimeoutError:
             state.acp_status = "timeout"
@@ -1107,6 +1151,7 @@ def run_case(record: Mapping[str, Any], config: CaseConfig) -> RunResult:
     run_id = _read_run_id(evaluation_dir)
     case_id = _case_id(record)
     query = _query(record)
+    metadata = CaseMetadata.from_record(record)
     case_dir = evaluation_dir / "cases" / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(case_dir / "input.json", dict(record))
@@ -1143,7 +1188,7 @@ def run_case(record: Mapping[str, Any], config: CaseConfig) -> RunResult:
     state = _AttemptState()
 
     try:
-        _copy_inputs(Path(config.dataset_root), workspace, _input_paths(record))
+        input_files = _copy_inputs(Path(config.dataset_root), workspace, _input_paths(record))
         write_snapshot(workspace, attempt_dir / "files-before.json")
         asyncio.run(
             _run_process(
@@ -1156,6 +1201,8 @@ def run_case(record: Mapping[str, Any], config: CaseConfig) -> RunResult:
                 accumulator,
                 process_recorder,
                 state,
+                metadata,
+                input_files,
             )
         )
     except Exception as error:

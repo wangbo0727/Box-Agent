@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -90,6 +91,101 @@ def run_mode(tmp_path: Path, mode: str, timeout: float = 2.0):
     )
     assert len(attempts) == 1
     return result, attempts[0], config, record
+
+
+def test_explicit_case_metadata_reaches_acp_without_granting_permissions(tmp_path: Path) -> None:
+    config = make_config(tmp_path, "normal")
+    external = str(tmp_path / "explicit-reference")
+    record = {
+        "id": "normal",
+        "query": "execute normal",
+        "input_files": [],
+        "session_meta": {"deep_think": True},
+        "prompt_meta": {
+            "auto_approve_plan": True,
+            "selected_skill_names": ["sn-ppt-web"],
+        },
+        "session_allowed_directories": [external],
+    }
+
+    result = run_case(record, config)
+
+    attempt = next((config.evaluation_dir / "cases/normal/attempts").iterdir())
+    sent = [entry["message"] for entry in read_jsonl(attempt / "protocol.jsonl")
+            if entry["direction"] == "sent"]
+    session = next(message["params"] for message in sent
+                   if message.get("method") == "session/new")
+    prompt = next(message["params"] for message in sent
+                  if message.get("method") == "session/prompt")
+    assert session["_meta"]["deep_think"] is True
+    assert session["_meta"]["permission_mode"] == "default"
+    assert session["_meta"]["filesystem_policy"]["allowed_directories"] == [external]
+    assert session["_meta"]["filesystem_policy"]["filesystem_scope"] == "session_workspace"
+    assert prompt["_meta"]["auto_approve_plan"] is True
+    assert prompt["_meta"]["selected_skill_names"] == ["sn-ppt-web"]
+    assert prompt["_meta"]["turnId"] == "eval-acp-normal-turn-1"
+    assert prompt["prompt"] == [{"type": "text", "text": record["query"]}]
+    assert next(message for message in sent if message.get("id") == 81)["result"] == {
+        "outcome": {"outcome": "cancelled"}
+    }
+    assert result.acp_status == "completed"
+    assert read_json(config.evaluation_dir / "cases/normal/input.json") == record
+
+
+def test_input_attachments_reach_acp_with_original_bytes_and_session_scoped_paths(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, "normal")
+    source = config.dataset_root / "input_files" / "上传 文档.md"
+    payload = "# 原始附件\n\n保留中文与空格。\n".encode("utf-8")
+    source.write_bytes(payload)
+    record = {
+        "id": "normal",
+        "query": "本地部署开源工具，把 Markdown 转成 PDF",
+        "input_files": [str(source.relative_to(config.dataset_root))],
+    }
+
+    result = run_case(record, config)
+
+    attempt = next((config.evaluation_dir / "cases/normal/attempts").iterdir())
+    staged = attempt / "workspace" / source.name
+    sent = [entry["message"] for entry in read_jsonl(attempt / "protocol.jsonl")
+            if entry["direction"] == "sent"]
+    prompt = next(message["params"] for message in sent
+                  if message.get("method") == "session/prompt")
+    session = next(message["params"] for message in sent
+                   if message.get("method") == "session/new")
+    assert prompt["prompt"][0] == {"type": "text", "text": record["query"]}
+    links = [block for block in prompt["prompt"] if block["type"] == "resource_link"]
+    assert links == [{
+        "type": "resource_link", "name": source.name,
+        "uri": staged.resolve().as_uri(), "mimeType": "text/markdown", "size": len(payload),
+    }]
+    attachment_text = "\n".join(block.get("text", "") for block in prompt["prompt"][1:])
+    assert str(staged.resolve()) in attachment_text
+    assert str(source.resolve()) not in attachment_text
+    assert staged.read_bytes() == source.read_bytes() == payload
+    before = read_json(attempt / "files-before.json")
+    assert before["files"][0]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert session["_meta"]["filesystem_policy"]["allowed_directories"] == []
+    assert session["_meta"]["filesystem_policy"]["filesystem_scope"] == "session_workspace"
+    assert result.acp_status == "completed"
+
+
+def test_absent_case_metadata_keeps_acp_defaults(tmp_path: Path) -> None:
+    _, attempt, _, _ = run_mode(tmp_path, "normal")
+    sent = [entry["message"] for entry in read_jsonl(attempt / "protocol.jsonl")
+            if entry["direction"] == "sent"]
+    session = next(message["params"] for message in sent
+                   if message.get("method") == "session/new")
+    prompt = next(message["params"] for message in sent
+                  if message.get("method") == "session/prompt")
+    assert set(session["_meta"]) == {
+        "title", "session_id", "permission_mode", "filesystem_policy", "workspace_layout"
+    }
+    assert session["_meta"]["filesystem_policy"]["allowed_directories"] == []
+    assert prompt["_meta"] == {"title": "acp", "turnId": "eval-acp-normal-turn-1"}
+    assert "clientCapabilities" not in sent[0]["params"]
 
 
 def test_normal_case_writes_self_contained_complete_attempt(tmp_path: Path) -> None:
