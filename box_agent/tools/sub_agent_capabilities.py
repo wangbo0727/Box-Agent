@@ -80,6 +80,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapabilityMetadata] = {
     "goal_read": ToolCapabilityMetadata(read=True),
     "goal_write": ToolCapabilityMetadata(write=True),
     "mcp_config": ToolCapabilityMetadata(write=True, external_side_effect=True),
+    "prepare_scheduled_task": ToolCapabilityMetadata(external_side_effect=True),
     "create_scheduled_task": ToolCapabilityMetadata(external_side_effect=True),
     "obsidian_create_note": ToolCapabilityMetadata(write=True, external_side_effect=True),
     "obsidian_update_note": ToolCapabilityMetadata(write=True, external_side_effect=True),

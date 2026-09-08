@@ -187,6 +187,8 @@ INVOKE_TOOL_SIGNATURE = (
     ("tool", inspect.Parameter.POSITIONAL_OR_KEYWORD, REQUIRED_PARAMETER),
     ("arguments", inspect.Parameter.POSITIONAL_OR_KEYWORD, REQUIRED_PARAMETER),
     ("permission_negotiator", inspect.Parameter.KEYWORD_ONLY, None),
+    ("invocation_context", inspect.Parameter.KEYWORD_ONLY, None),
+    ("is_cancelled", inspect.Parameter.KEYWORD_ONLY, None),
 )
 
 

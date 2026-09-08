@@ -55,6 +55,7 @@ from box_agent.agent import (
 )
 from box_agent.config import AgentConfig, Config
 from box_agent.events import StopReason
+from box_agent.runtime import invoke_tool_with_permissions
 from box_agent.goal_runtime import (
     GoalAutopilotController,
 )
@@ -2624,7 +2625,7 @@ async def run_agent(
                         # Find the sandbox status tool and execute it
                         for tool in tools:
                             if isinstance(tool, SandboxStatusTool):
-                                result = await tool.invoke({})
+                                result, _ = await invoke_tool_with_permissions(tool, {})
                                 if result.success:
                                     print(f"\n{Colors.BRIGHT_CYAN}{result.content}{Colors.RESET}\n")
                                 else:

@@ -17,35 +17,23 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Final
 from urllib.parse import urlsplit
 
-from ..artifacts import (
-    OUTPUT_SUBDIR,
-    artifact_scan_root as _artifact_scan_root,
-    avoid_collision,
-    ensure_output_dir,
-    make_artifact as _make_artifact,
-    safe_output_name,
-)
 from ..cache_fingerprint import build_cache_fingerprint
 from ..config import AgentConfig, ToolLimitsConfig
 from ..context_resources import (
     ContextResourceLedger,
-    ResourceDescriptor,
-    build_resource_receipt,
 )
 from ..evidence import (
     extract_http_urls as _http_urls,
-    normalize_search_url as _normalize_search_url,
 )
 from ..events import (
     AgentEvent,
-    ArtifactEvent,
     ContentEvent,
     DoneEvent,
     ErrorEvent,
@@ -55,9 +43,7 @@ from ..events import (
     LogFileEvent,
     MemoryProposalEvent,
     MemoryPromotionCandidate,
-    PermissionRequestEvent,
     PlanSnapshotEvent,
-    ProgressEvent,
     StepEnd,
     StepStart,
     StopReason,
@@ -65,146 +51,32 @@ from ..events import (
     ThinkingEvent,
     TokenUsageEvent,
     ToolCallResult,
-    ToolCallStart,
-    WebSearchEvent,
 )
 from .context_engine import (
-    TRANSIENT_FOLLOWUP_CONTEXT_RATIO,
-    TRANSIENT_IMAGE_DEFAULT_TOKENS,
-    TRANSIENT_IMAGE_MAX_TOKENS,
-    TRANSIENT_IMAGE_PIXEL_TOKEN_DIVISOR,
-    CompactionOutcome,
-    _LEGACY_SUMMARY_MARKER,
-    _LOCAL_FALLBACK_CHAR_LIMIT,
-    _RECENT_MESSAGE_CHAR_LIMIT,
-    _RECENT_MESSAGE_LIMIT,
-    _RUNTIME_STATE_MARKER,
-    _RUNTIME_STATE_CHAR_LIMIT,
-    _SUMMARY_MARKER,
-    _SUMMARY_MESSAGE_PREFIX,
-    _SUMMARY_MESSAGE_SUFFIX,
-    _SUMMARY_OUTPUT_CHAR_LIMIT,
-    _SUMMARY_REQUEST,
-    _WORKFLOW_CHECKPOINT_MARKER,
-    _bound_retained_messages,
-    _bound_text_middle,
-    _create_summary,
-    _deterministic_history_fallback,
-    _estimate_context_from_latest_response,
-    _fallback_context_estimate,
     _is_compaction_metadata,
-    _is_summary_marker,
     _maybe_summarize,
-    _message_chars,
-    _recent_message_groups,
-    _restore_runtime_state,
-    _select_recent_messages,
-    _summary_message_text,
-    _transient_followup_token_estimate,
     _validate_transient_followup_result,
 )
-from .permission_gateway import (
-    MAX_TOOL_PERMISSION_RETRIES,
-    _approve_tool_permission,
-    _negotiate_tool_permission_chain,
-    _permission_event_kwargs,
-    _policy_decision_payload,
-)
 from .ports import KernelServices
+from .tool_messages import ToolMessageCommitter
+from ..tools.engine.call_contracts import (
+    ToolExecutionOptions, ToolRunContext, ToolStepControl, ToolStepSummary,
+)
 from .stream_controller import (
     StreamInterruptionRecovery,
     resolve_provider_stale_seconds as _kernel_resolve_provider_stale_seconds,
     stream_with_activity as _kernel_stream_with_activity,
 )
-from .state import ToolBudgetState
-from .tool_engine import (
-    ToolBatchCompleted,
-    ToolEngine,
-    ToolEngineActivity,
-    ToolEngineProgress,
-    ToolInvocationCompleted,
-    ToolInvocationRequest,
-)
-from .tool_result_pipeline import (
-    _prepare_browser_screenshot_output,
-    _persist_browser_screenshot_output,
-    _trace_safe_tool_raw_output,
-    _ARTIFACT_REF_RE,
-    _BROWSER_SNAPSHOT_OUTPUT_PATH_ERROR,
-    _ContextResourceHistoryDecision,
-    _IGNORE_DIRS,
-    _INTERRUPTED_TOOL_STUB,
-    _MAX_ARTIFACT_COMPONENT_BYTES,
-    _MAX_ARTIFACT_REF_CHARS,
-    _MODEL_HISTORY_FILE_MUTATION_TOOLS,
-    _MODEL_HISTORY_PLACEHOLDER_ARGUMENTS,
-    _MODEL_HISTORY_PLACEHOLDER_RECOVERY_REQUIRED,
-    _ModelHistoryPlaceholderRecovery,
-    _PLOT_DATA_RE,
-    _SEARCH_QUERY_STOPWORDS,
-    _SEARCH_QUERY_TERM_RE,
-    _SITE_QUERY_RE,
-    _SITE_QUERY_TOKEN_RE,
-    _WEB_SEARCH_COMPACT_MAX_ITEMS,
-    _WEB_SEARCH_RESULT_KEYS,
-    _candidate_search_items,
+from .tool_messages import (
     _cleanup_incomplete_messages,
-    _context_resource_history_decision,
-    _dedupe_web_search_content,
-    _detect_artifacts,
-    _detect_changed_files,
-    _detect_new_files,
-    _detect_regex_artifacts,
-    _detect_tool_artifacts,
-    _extract_web_search_payload,
-    _first_present,
-    _log_web_search_model_results,
-    _model_history_placeholder_argument,
-    _model_history_placeholder_recovery_error,
-    _model_history_recovery_target,
-    _normalize_search_title,
-    _normalize_web_search_query,
-    _persist_browser_snapshot_output,
-    _prepare_browser_snapshot_output,
-    _rank_web_search_items,
-    _record_context_resource_history,
-    _record_model_history_placeholder_recovery_result,
-    _repeatable_framework_error,
-    _requested_site_domain,
     _sanitize_dangling_tool_calls,
-    _search_item_snippet,
-    _search_item_title,
-    _search_item_url,
-    _search_result_list_found,
-    _short_tool_text,
-    _snapshot_workspace,
-    _snapshot_workspace_signatures,
-    _strip_plot_data,
-    _tool_message_content_for_model,
-    _url_matches_domain,
-    _web_search_item_rank,
-    _web_search_match_terms,
-    _web_search_queries_are_near_duplicates,
-    _web_search_query_terms,
-    _web_search_result_key,
-    _web_search_result_metadata,
-    _with_filtered_search_items,
-    _with_web_search_metadata,
-    ToolResultPipelineInput,
-    process_tool_result,
 )
 from ..logger import AgentLogger
 from ..llm.debug_logging import reset_llm_debug_sink, set_llm_debug_sink
-from ..model_history import is_model_history_placeholder
-from ..session_trace import emit_session_trace
-from ..session_log import SessionLogDurabilityError
 from ..loop_guards import (
     EMPTY_ARGS_LIMIT,
-    FINAL_SUMMARY_EXCLUDED_TOOLS,
-    SEARCH_FILES_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
     STREAM_REPEAT_MIN_CHUNKS,
-    delegated_tool_call_budget_wrapup_text,
     format_injected_message,
     format_runtime_context_update,
     looks_like_truncated_output,
@@ -212,10 +84,6 @@ from ..loop_guards import (
     no_progress_wrapup_text,
     repeated_stream_pattern,
     reply_is_substantial,
-    search_files_empty_result_guidance,
-    search_files_result_is_empty,
-    total_tool_call_budget_wrapup_text,
-    tool_call_budget_wrapup_text,
     truncation_continuation_text,
 )
 
@@ -299,15 +167,12 @@ from ..schema import LLMResponse, Message, StreamEvent
 from ..tools.base import (
     Tool,
     ToolResult,
-    build_tool_name_index,
 )
 from ..tools.argument_limits import RECOMMENDED_GENERATED_BODY_CHARS
 from ..tools.browser_intent import BrowserToolIntentPolicy
-from ..tools.skill_preload import build_active_skills_prompt
 from ..tool_result_storage import ToolResultStorage
 from ..turn_continuation import TurnContinuationController
 from ..turn_policy import (
-    text_is_short_acknowledgement,
     text_is_short_non_task_reply,
     text_requests_plan_start,
 )
@@ -317,21 +182,11 @@ from ..turn_policy import (
 CancelChecker = Callable[[], bool]
 ActiveSkillActivator = Callable[[str, str], None]
 
-_MODEL_HISTORY_PLACEHOLDER_REPAIR_LIMIT: Final[int] = 1
-_MODEL_HISTORY_PLACEHOLDER_TOOL_ERROR = (
-    "INTERNAL_MODEL_HISTORY_PLACEHOLDER: the requested tool argument is an internal "
-    "history summary, not executable content. Regenerate the real argument. For static "
-    "artifacts, use ordered write_file chunks instead of moving the body into execute_code."
-)
-_MODEL_HISTORY_PLACEHOLDER_REPAIR_GUIDANCE = (
-    "An internal model-history placeholder was returned as a tool argument. Regenerate "
-    "the missing real content now. Never copy text beginning with "
-    "`[Full tool-call argument omitted from model history]`, `[Full file content omitted "
-    "from model history]`, or `[Full tool output omitted from model history]` into any "
-    "tool argument. For long static artifacts, continue write_file from the "
-    "next_chunk_index returned by the last successful call for that path, or use "
-    "chunk_index=0 only if no chunk has been accepted. Keep final=false until the "
-    "last chunk; do not move the file body into execute_code."
+# Compatibility constants remain importable here; file recovery owns them.
+from ..tools.file_result_adapter import (
+    _MODEL_HISTORY_PLACEHOLDER_REPAIR_LIMIT,
+    _MODEL_HISTORY_PLACEHOLDER_TOOL_ERROR,
+    _MODEL_HISTORY_PLACEHOLDER_REPAIR_GUIDANCE,
 )
 
 _OUTPUT_LENGTH_TOOL_RECOVERY = (
@@ -1055,54 +910,6 @@ async def _run_agent_loop_impl(
     # while the provider reported a normal finish.
     truncation_continuations = 0
 
-    fallback_active_skill_prompts: dict[str, str] = {}
-
-    def _activate_skill_result(
-        tool_name: str,
-        arguments: dict[str, Any],
-        result: ToolResult,
-    ) -> ToolResult:
-        """Move a loaded skill from tool history into active system context."""
-        tool = tools.get(tool_name)
-        skill_name = arguments.get("skill_name")
-        if (
-            tool is None
-            or not getattr(tool, "loads_active_skill_instructions", False)
-            or not result.success
-            or result.model_context is not None
-            or not isinstance(skill_name, str)
-            or not skill_name.strip()
-            or not result.content.strip()
-            or bool((result.raw_output or {}).get("broken"))
-        ):
-            return result
-
-        normalized_name = skill_name.strip()
-        if active_skill_activator is not None:
-            active_skill_activator(normalized_name, result.content)
-        elif messages and messages[0].role == "system":
-            fallback_active_skill_prompts[normalized_name] = result.content
-            system_content = (
-                messages[0].content
-                if isinstance(messages[0].content, str)
-                else str(messages[0].content)
-            )
-            messages[0] = Message(
-                role="system",
-                content=build_active_skills_prompt(
-                    system_content,
-                    fallback_active_skill_prompts,
-                ),
-            )
-        else:
-            return result
-
-        acknowledgement = (
-            f"Skill '{normalized_name}' loaded into active system instructions. "
-            "Follow those instructions for the active task."
-        )
-        return result.model_copy(update={"model_context": acknowledgement})
-
     # Truncated tool-call retry counter. When the provider (or a relay) clips
     # a tool_call's argument stream mid-JSON, retry the same turn with the
     # SAME message state — no broken assistant turn is appended — and boost
@@ -1124,23 +931,43 @@ async def _run_agent_loop_impl(
     # after it already has enough evidence. Once a budget is reached, later
     # calls are answered with synthetic tool errors so the protocol remains
     # valid while nudging the model to synthesize.
-    tool_budget_state = ToolBudgetState(
-        tool_call_limits=tool_call_limits,
-        max_tool_calls=max_tool_calls,
-        max_delegated_tool_calls=max_delegated_tool_calls,
-        search_files_empty_result_limit=search_files_empty_result_limit,
-        logger=_log,
+    tool_engine = _services.tool_engine
+    assert tool_engine is not None
+    tool_messages = ToolMessageCommitter(messages, session_log, session_turn)
+    tool_engine.configure_run(
+        ToolRunContext(
+            messages=messages, hooks=hook_mgr, result_storage=result_storage,
+            is_cancelled=cancelled, record_call=tool_messages.record_call,
+            flush_calls=tool_messages.flush_calls,
+            commit_result=tool_messages.commit_result,
+            validate_followup=lambda result, tool, pending: _validate_transient_followup_result(
+                result=result, tool=tool, llm=llm, token_limit=token_limit,
+                pending_token_estimate=pending,
+            ),
+            policy_error=browser_intent_policy.tool_call_error,
+            workspace_dir=workspace_dir, artifact_root_dir=artifact_root_dir,
+            session_id=session_id, turn_id=turn_id,
+            permission_negotiator=permission_negotiator, logger=logger,
+            resource_ledger=resource_ledger, activate_skill=active_skill_activator,
+        ),
+        ToolExecutionOptions(
+            tool_call_limits=tool_call_limits, max_tool_calls=max_tool_calls,
+            max_delegated_tool_calls=max_delegated_tool_calls,
+            search_files_empty_result_limit=search_files_empty_result_limit,
+            web_search_batch_size=web_search_batch_size,
+            web_search_concurrency=web_search_concurrency,
+            max_parallel_tools=max_parallel_tools,
+            batch_timeout_seconds=parallel_tool_timeout_seconds,
+            activity_interval_seconds=_runtime_defaults.tool_activity_interval_seconds,
+            event_poll_interval_seconds=_runtime_defaults.tool_event_poll_interval_seconds,
+            cancel_grace_seconds=_runtime_defaults.parallel_tool_cancel_grace_seconds,
+            artifact_detection_enabled=artifact_detection_enabled,
+        ),
     )
     visible_tool_call_total = 0
     final_summary_guidance_injected = False
     empty_final_answer_retry_injected = False
-    web_search_seen_queries: set[str] = set()
-    web_search_seen_result_keys: set[str] = set()
     verified_evidence_urls: set[str] = set()
-    web_search_unique_results = 0
-    web_search_duplicate_results = 0
-    web_search_no_new_batches = 0
-    search_files_empty_guidance_injected = False
     plan_start_emitted = False
     forced_plan_guidance_injected = False
     forced_plan_retry_injected = False
@@ -1149,9 +976,6 @@ async def _run_agent_loop_impl(
     plan_approval_request_id = "plan-" + hashlib.sha1(
         f"{run_start}:{_latest_user_text(messages)}".encode("utf-8", errors="ignore")
     ).hexdigest()[:10]
-    model_history_placeholder_repairs = 0
-    model_history_framework_error_counts: dict[str, int] = {}
-    pending_model_history_recovery: _ModelHistoryPlaceholderRecovery | None = None
 
     for step in range(max_steps):
         if resource_ledger is not None:
@@ -1175,16 +999,6 @@ async def _run_agent_loop_impl(
             return
 
         step_start = perf_counter()
-        web_search_step_seen = False
-        web_search_step_executed = 0
-        web_search_step_deferred = 0
-        web_search_step_duplicate_queries = 0
-        web_search_step_new_results = 0
-        web_search_step_duplicate_results = 0
-        web_search_step_structured_results = 0
-        web_search_step_labels: list[str] = []
-        model_history_placeholder_auto_repair_requested = False
-
         # ── Drain inject queue (in-stream injection) ───────
         if inject_queue:
             while not inject_queue.empty():
@@ -1265,66 +1079,9 @@ async def _run_agent_loop_impl(
             )
             yield PlanSnapshotEvent(payload=_plan_start_payload(approval))
 
-        for tool_name, limit in tool_call_limits.items():
-            if (
-                tool_budget_state.tool_call_counts.get(tool_name, 0) >= limit
-                and tool_name not in tool_budget_state.tool_budget_wrapup_injected
-            ):
-                tool_budget_state.tool_budget_wrapup_injected.add(tool_name)
-                budget_text = tool_call_budget_wrapup_text(tool_name, limit)
-                messages.append(
-                    Message(role="user", content=format_injected_message(budget_text))
-                )
-                yield InjectedMessageEvent(content=budget_text, injection_id=None, user_visible=False)
-        if (
-            max_delegated_tool_calls is not None
-            and tool_budget_state.delegated_tool_call_total >= max_delegated_tool_calls
-            and not tool_budget_state.delegated_budget_guidance_injected
-        ):
-            tool_budget_state.delegated_budget_guidance_injected = True
-            delegated_text = delegated_tool_call_budget_wrapup_text(
-                max_delegated_tool_calls
-            )
-            messages.append(
-                Message(role="user", content=format_injected_message(delegated_text))
-            )
-            yield InjectedMessageEvent(
-                content=delegated_text,
-                injection_id=None,
-                user_visible=False,
-            )
-        if (
-            tool_budget_state.search_files_consecutive_empty_results
-            >= search_files_empty_result_limit
-            and not search_files_empty_guidance_injected
-        ):
-            search_files_empty_guidance_injected = True
-            guidance = search_files_empty_result_guidance(
-                search_files_empty_result_limit
-            )
-            messages.append(
-                Message(role="user", content=format_injected_message(guidance))
-            )
-            yield InjectedMessageEvent(
-                content=guidance,
-                injection_id=None,
-                user_visible=False,
-            )
-        if (
-            max_tool_calls is not None
-            and tool_budget_state.tool_call_total >= max_tool_calls
-            and "__total__" not in tool_budget_state.tool_budget_wrapup_injected
-        ):
-            tool_budget_state.tool_budget_wrapup_injected.add("__total__")
-            budget_text = total_tool_call_budget_wrapup_text(max_tool_calls)
-            messages.append(
-                Message(role="user", content=format_injected_message(budget_text))
-            )
-            yield InjectedMessageEvent(
-                content=budget_text,
-                injection_id=None,
-                user_visible=False,
-            )
+        for guidance in tool_engine.budget_guidance():
+            messages.append(Message(role="user", content=format_injected_message(guidance)))
+            yield InjectedMessageEvent(content=guidance, injection_id=None, user_visible=False)
 
         # ── Fresh tool-result aggregate budget (Layer 1) ───
         # This runs immediately before the next LLM request. Decisions are
@@ -1502,23 +1259,11 @@ async def _run_agent_loop_impl(
             await hook_mgr.fire_step_start(step=step + 1, max_steps=max_steps)
 
         # ── LLM call (streaming) ──────────────────────────────
-        tool_list = list(tools.values())
-        offered_mcp_generations: dict[str, int] = {}
-        if tool_exposure_manager is not None:
-            exposure = tool_exposure_manager.prepare_tools(tool_list)
-            tool_list = exposure.tools
-            offered_mcp_generations = exposure.mcp_generations
-        # Apply intent filtering after catalog exposure so an activated MCP
-        # browser tool cannot bypass the same visibility policy as a stable
-        # core/fallback tool.
-        tool_list = [
-            tool
-            for tool in tool_list
-            if browser_intent_policy.is_tool_visible(tool.name)
-        ]
-        offered_tools_by_name = {tool.name: tool for tool in tool_list}
-        offered_tools_by_call_name = build_tool_name_index(tool_list)
-        offered_tool_names = frozenset(offered_tools_by_name)
+        prepared_tools = _services.tool_engine.prepare_tools(
+            is_tool_visible=browser_intent_policy.is_tool_visible,
+        )
+        tool_list = list(prepared_tools.definitions)
+        offered_tools_by_name = prepared_tools.targets
         request_context_messages = [
             message
             for message in (auto_memory_context_message,)
@@ -1590,28 +1335,6 @@ async def _run_agent_loop_impl(
             )
             session_log.flush()
 
-        def _tool_target_identity(tool_name: str) -> tuple[str | None, str | None]:
-            tool = offered_tools_by_name.get(tool_name)
-            tool_id = getattr(tool, "mcp_tool_id", None)
-            server_name = getattr(tool, "server_name", None)
-            return (
-                tool_id if isinstance(tool_id, str) and tool_id else None,
-                server_name if isinstance(server_name, str) and server_name else None,
-            )
-
-        def _tool_offer_error(tool_name: str) -> str | None:
-            if tool_exposure_manager is None:
-                return None
-            if tool_name not in offered_tool_names:
-                return (
-                    f"Tool '{tool_name}' was not offered in this model step. "
-                    "Use tool_search and call an activated result on the next step."
-                )
-            return tool_exposure_manager.validate_call(
-                tool_name,
-                offered_mcp_generations.get(tool_name),
-                offered_tools_by_name.get(tool_name),
-            )
 
         cache_fingerprint = build_cache_fingerprint(
             messages=request_messages,
@@ -2558,15 +2281,7 @@ async def _run_agent_loop_impl(
         # Resolve backwards-compatible aliases only against tools offered in
         # this model step. Keep the persisted assistant turn unchanged, while
         # all execution policy sees the canonical tool name.
-        execution_tool_calls = []
-        for tool_call in response.tool_calls:
-            execution_call = tool_call.model_copy(deep=True)
-            resolved_tool = offered_tools_by_call_name.get(
-                execution_call.function.name
-            )
-            if resolved_tool is not None:
-                execution_call.function.name = resolved_tool.name
-            execution_tool_calls.append(execution_call)
+        execution_tool_calls = prepared_tools.canonicalize_calls(response.tool_calls)
 
         # ── Execute tool calls ──────────────────────────────
         # Loop-guard: bail out if the model emits the same all-empty-args
@@ -2600,1080 +2315,56 @@ async def _run_agent_loop_impl(
             empty_args_signature = None
             empty_args_repeats = 0
 
-        # Deduplicate identical calls emitted in the same assistant response.
-        # Some providers occasionally repeat a mutation call byte-for-byte;
-        # executing both can corrupt state or turn the second call into a
-        # misleading conflict. Keep every original tool_call in model history,
-        # but execute only the first occurrence and synthesize hidden replies
-        # for its duplicates below so the protocol remains valid.
-        unique_tool_calls = []
-        duplicate_tool_calls = []
-        first_tool_call_by_signature: dict[tuple[str, str], Any] = {}
-        duplicate_source_by_id: dict[str, str] = {}
-        for tc in execution_tool_calls:
-            signature = (
-                tc.function.name,
-                json.dumps(
-                    tc.function.arguments,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ),
-            )
-            first = first_tool_call_by_signature.get(signature)
-            if first is None:
-                first_tool_call_by_signature[signature] = tc
-                unique_tool_calls.append(tc)
-            else:
-                duplicate_source_by_id[tc.id] = first.id
-                duplicate_tool_calls.append(tc)
-
-        if duplicate_tool_calls:
-            _log.info(
-                "tool/dedupe skipped=%d unique=%d",
-                len(duplicate_tool_calls),
-                len(unique_tool_calls),
-            )
-
-        # Preserve model order when a step mixes search with stateful tools.
-        # Search-only batches may opt into bounded parallel execution without
-        # declaring every MCP tool parallel-safe.
-        parallel_web_search_batch = (
-            web_search_concurrency > 1
-            and bool(unique_tool_calls)
-            and all(
-                tc.function.name == WEB_SEARCH_TOOL_NAME
-                for tc in unique_tool_calls
-            )
-        )
-
-        # A successful interactive tool is a turn boundary. Preserve the
-        # model's exact call order for the whole step so only calls before that
-        # boundary can run; later siblings receive deterministic skip results.
-        step_has_turn_ending_tool = any(
-            getattr(
-                offered_tools_by_name.get(tc.function.name),
-                "ends_turn_on_success",
-                False,
-            )
-            for tc in unique_tool_calls
-        )
-
-        # Split unique calls into regular (sequential) and parallel_safe groups.
-        regular_calls = []
-        parallel_calls = []
-        for tc in unique_tool_calls:
-            fn_name = tc.function.name
-            if step_has_turn_ending_tool:
-                regular_calls.append(tc)
-            elif _model_history_placeholder_argument(fn_name, tc.function.arguments):
-                # Placeholder repair is stateful and must be handled by the
-                # sequential branch even if a future mutation tool is marked
-                # parallel-safe.
-                regular_calls.append(tc)
-            elif fn_name in offered_tools_by_name and (
-                (
-                    fn_name == WEB_SEARCH_TOOL_NAME
-                    and parallel_web_search_batch
-                )
-                or getattr(offered_tools_by_name[fn_name], "parallel_safe", False)
-            ):
-                parallel_calls.append(tc)
-            else:
-                regular_calls.append(tc)
-
-        step_contains_plan_write = any(
-            tc.function.name == "plan_write" for tc in [*regular_calls, *parallel_calls]
-        )
+        # The kernel decides the conversation boundary. The engine owns all
+        # per-call preparation, scheduling, permission continuation and results.
+        step_contains_plan_write = any(tc.function.name == "plan_write" for tc in execution_tool_calls)
         organic_plan_approval_gate_enabled = (
-            pause_after_plan_write
-            and not plan_approval_approved
-            and not plan_approval_gate_enabled
-            and has_plan_tool
-            and step_contains_plan_write
+            pause_after_plan_write and not plan_approval_approved
+            and not plan_approval_gate_enabled and has_plan_tool and step_contains_plan_write
         )
-        plan_approval_gate_active = (
-            plan_approval_gate_enabled or organic_plan_approval_gate_enabled
+        plan_approval_gate_active = plan_approval_gate_enabled or organic_plan_approval_gate_enabled
+
+        def decorate_control_result(name: str, result: ToolResult) -> ToolResult:
+            if plan_approval_gate_active and name == "plan_write" and result.success:
+                return result.model_copy(update={"raw_output": _attach_plan_approval_payload(
+                    result.raw_output, request_id=plan_approval_request_id,
+                )})
+            return result
+
+        control = ToolStepControl(
+            step=step + 1,
+            allowed_names=frozenset({"plan_write"}) if plan_approval_gate_active else None,
+            blocked_reason=_PLAN_APPROVAL_SKIP_MESSAGE,
+            result_transform=decorate_control_result,
+            pending_followup_tokens=pending_transient_followup_tokens,
         )
-
-        # Track whether this step produced any useful tool result, for the
-        # no-progress circuit breaker. Set True in either execution branch.
-        step_made_progress = False
-        step_tool_success_by_id: dict[str, bool] = {}
-        completed_turn_ending_tool: str | None = None
-
-        def _record_search_files_result(tool_name: str, result: ToolResult) -> None:
-            if tool_name != SEARCH_FILES_TOOL_NAME:
-                return
-            if search_files_result_is_empty(result):
-                tool_budget_state.search_files_consecutive_empty_results += 1
-            elif result.success:
-                tool_budget_state.search_files_consecutive_empty_results = 0
-
-        def _reserve_web_search_call(arguments: dict[str, Any]) -> tuple[bool, str | None]:
-            nonlocal web_search_step_seen
-            nonlocal web_search_step_executed
-            nonlocal web_search_step_deferred
-            nonlocal web_search_step_duplicate_queries
-
-            web_search_step_seen = True
-            query_key = _normalize_web_search_query(arguments)
-            duplicate_query = next(
-                (
-                    seen_query
-                    for seen_query in web_search_seen_queries
-                    if _web_search_queries_are_near_duplicates(
-                        query_key,
-                        seen_query,
-                    )
-                ),
-                None,
-            )
-            if duplicate_query is not None:
-                web_search_step_duplicate_queries += 1
-                return (
-                    False,
-                    "Duplicate web_search query skipped by runtime batching "
-                    "(exact or near-duplicate). "
-                    f"It substantially overlaps {duplicate_query!r}. Use the evidence already "
-                    "returned and search a genuinely different evidence gap.",
-                )
-            if web_search_step_executed >= web_search_batch_size:
-                web_search_step_deferred += 1
-                return (
-                    False,
-                    f"web_search deferred by runtime batching (batch size {web_search_batch_size}). "
-                    "Review the current batch results and re-issue only still-missing, non-duplicate queries.",
-                )
-
-            allowed_by_budget, budget_error = tool_budget_state.reserve(WEB_SEARCH_TOOL_NAME)
-            if not allowed_by_budget:
-                return False, budget_error
-            if query_key:
-                web_search_seen_queries.add(query_key)
-            web_search_step_executed += 1
-            return True, None
-
-        tool_engine = ToolEngine(
-            tools=offered_tools_by_name,
-            is_cancelled=cancelled,
-            activity_interval_seconds=(
-                _runtime_defaults.tool_activity_interval_seconds
-            ),
-            event_poll_interval_seconds=(
-                _runtime_defaults.tool_event_poll_interval_seconds
-            ),
-            cancel_grace_seconds=(
-                _runtime_defaults.parallel_tool_cancel_grace_seconds
-            ),
-            max_parallel_tools=max_parallel_tools,
-            batch_timeout_seconds=parallel_tool_timeout_seconds,
-            web_search_concurrency=web_search_concurrency,
-            web_search_tool_name=WEB_SEARCH_TOOL_NAME,
-            passthrough_exceptions=(SessionLogDurabilityError,),
-        )
-
-        # 1. Sequential execution for regular tools (preserves ordering)
-        for tc in regular_calls:
-            tc_id = tc.id
-            fn_name = tc.function.name
-            fn_args = tc.function.arguments
-            (
-                browser_snapshot_target,
-                browser_snapshot_path_error,
-            ) = _prepare_browser_snapshot_output(
-                fn_name,
-                fn_args,
-                workspace_dir,
-                artifact_root_dir,
-            )
-            (
-                browser_screenshot_target,
-                browser_screenshot_path_error,
-            ) = _prepare_browser_screenshot_output(
-                fn_name,
-                fn_args,
-                workspace_dir,
-                artifact_root_dir,
-            )
-            browser_snapshot_path_error = (
-                browser_snapshot_path_error or browser_screenshot_path_error
-            )
-            placeholder_argument = _model_history_placeholder_argument(fn_name, fn_args)
-            can_auto_repair_placeholder = (
-                placeholder_argument is not None
-                and model_history_placeholder_repairs
-                < _MODEL_HISTORY_PLACEHOLDER_REPAIR_LIMIT
-            )
-            browser_intent_error = browser_intent_policy.tool_call_error(
-                fn_name,
-                fn_args,
-            )
-            placeholder_recovery_error = _model_history_placeholder_recovery_error(
-                pending_model_history_recovery,
-                fn_name,
-                fn_args,
-                workspace_dir,
-                artifact_root_dir,
-            )
-
-            offered_error = _tool_offer_error(fn_name)
-
-            if completed_turn_ending_tool is not None:
-                allowed_to_execute = False
-                internal_skip_error = (
-                    f"Skipped because interactive tool '{completed_turn_ending_tool}' "
-                    "already completed in this model step. Resume after the user responds."
-                )
-            elif offered_error is not None:
-                allowed_to_execute = False
-                internal_skip_error = offered_error
-            elif browser_intent_error is not None:
-                allowed_to_execute = False
-                internal_skip_error = browser_intent_error
-            elif placeholder_argument is not None:
-                allowed_to_execute = False
-                internal_skip_error = (
-                    f"{_MODEL_HISTORY_PLACEHOLDER_TOOL_ERROR} "
-                    f"Rejected argument: {fn_name}.{placeholder_argument}."
-                )
-                if can_auto_repair_placeholder:
-                    model_history_placeholder_auto_repair_requested = True
-                if pending_model_history_recovery is None:
-                    pending_model_history_recovery = _ModelHistoryPlaceholderRecovery(
-                        tool_name=fn_name,
-                        argument_name=placeholder_argument,
-                        target=_model_history_recovery_target(
-                            fn_name,
-                            fn_args,
-                            workspace_dir,
-                            artifact_root_dir,
-                        ),
-                        action=(
-                            str(fn_args.get("action"))
-                            if fn_name == "staged_file_write"
-                            else None
-                        ),
-                    )
-            elif placeholder_recovery_error is not None:
-                allowed_to_execute = False
-                internal_skip_error = placeholder_recovery_error
-            elif browser_snapshot_path_error is not None:
-                allowed_to_execute = False
-                internal_skip_error = browser_snapshot_path_error
-            elif plan_approval_gate_active and fn_name != "plan_write":
-                allowed_to_execute = False
-                internal_skip_error = _PLAN_APPROVAL_SKIP_MESSAGE
-            elif fn_name == WEB_SEARCH_TOOL_NAME:
-                allowed_to_execute, internal_skip_error = _reserve_web_search_call(fn_args)
-            else:
-                allowed_to_execute, internal_skip_error = tool_budget_state.reserve(fn_name)
-            tool_user_visible = (
-                placeholder_argument is not None and not can_auto_repair_placeholder
-            ) or allowed_to_execute
-            if tool_user_visible and fn_name not in FINAL_SUMMARY_EXCLUDED_TOOLS:
-                visible_tool_call_total += 1
-
-            tool_id, server_name = _tool_target_identity(fn_name)
-            yield ToolCallStart(
-                tool_call_id=tc_id,
-                tool_name=fn_name,
-                arguments=fn_args,
-                user_visible=tool_user_visible,
-                tool_id=tool_id,
-                server_name=server_name,
-            )
-
-            # Hook: tool start (interceptor — may modify arguments)
-            if hook_mgr.hooks and tool_user_visible and allowed_to_execute:
-                fn_args = await hook_mgr.fire_tool_start(
-                    tool_call_id=tc_id, tool_name=fn_name, arguments=fn_args,
-                )
-            if (
-                session_log is not None
-                and session_turn is not None
-                and allowed_to_execute
-                and fn_name in offered_tools_by_name
-            ):
-                session_log.append(
-                    "tool/call",
-                    {
-                        "turn": session_turn,
-                        "step": step + 1,
-                        "callId": tc_id,
-                        "name": fn_name,
-                        "arguments": fn_args,
-                    },
-                )
-                session_log.flush()
-            tool_started_at = perf_counter()
-            emit_session_trace(
-                "tool.request",
-                turn_id=turn_id,
-                step=step + 1,
-                tool_call_id=tc_id,
-                data={
-                    "tool_name": fn_name,
-                    "tool_id": tool_id,
-                    "server_name": server_name,
-                    "arguments": fn_args,
-                    "allowed_to_execute": allowed_to_execute,
-                    "user_visible": tool_user_visible,
-                },
-            )
-
-            # Snapshot workspace before tool execution for diff-based artifact detection
-            pre_files: dict[Path, tuple[int, int]] = {}
-            if artifact_detection_enabled and allowed_to_execute and tool_user_visible and workspace_dir:
-                pre_files = _snapshot_workspace_signatures(
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-
-            if not allowed_to_execute:
-                result = ToolResult(success=False, content="", error=internal_skip_error or "")
-            elif fn_name not in offered_tools_by_name:
-                result = ToolResult(success=False, content="", error=f"Unknown tool: {fn_name}")
-            elif (
-                current_offer_error := _tool_offer_error(fn_name)
-            ):
-                result = ToolResult(success=False, content="", error=current_offer_error)
-            else:
-                completion: ToolInvocationCompleted | None = None
-                async with aclosing(
-                    tool_engine.invoke_serial(
-                        ToolInvocationRequest(
-                            call_id=tc_id,
-                            tool_name=fn_name,
-                            arguments=fn_args,
-                        )
-                    )
-                ) as engine_events:
-                    async for engine_record in engine_events:
-                        if isinstance(engine_record, ToolEngineProgress):
-                            yield engine_record.event
-                        elif isinstance(engine_record, ToolEngineActivity):
-                            yield LLMActivityEvent(
-                                step=step + 1,
-                                payload={
-                                    "protocol": "agent_activity_v1",
-                                    "phase": "tool_running",
-                                    "tool_name": engine_record.tool_name,
-                                },
-                            )
-                        elif isinstance(engine_record, ToolInvocationCompleted):
-                            completion = engine_record
-                if completion is None:
-                    result = ToolResult(
-                        success=False,
-                        content="",
-                        error="Tool execution interrupted — no result returned.",
-                    )
+        tool_summary: ToolStepSummary | None = None
+        async with aclosing(tool_engine.execute_calls(prepared_tools, response.tool_calls, control)) as records:
+            async for record in records:
+                if isinstance(record, ToolStepSummary):
+                    tool_summary = record
                 else:
-                    result = completion.result
-
-            if plan_approval_gate_active and fn_name == "plan_write" and result.success:
-                result = result.model_copy(
-                    update={
-                        "raw_output": _attach_plan_approval_payload(
-                            result.raw_output,
-                            request_id=plan_approval_request_id,
-                        )
-                    }
-                )
-                plan_approval_gate_completed = True
-
-            policy_decision: dict[str, Any] | None = None
-            # Log tool result
-            if logger:
-                logger.log_tool_result(
-                    tool_name=fn_name,
-                    arguments=fn_args,
-                    result_success=result.success,
-                    result_content=result.content if result.success else None,
-                    result_error=result.error if not result.success else None,
-                    raw_output=_trace_safe_tool_raw_output(result.raw_output),
-                    tool_id=tool_id,
-                    server_name=server_name,
-                )
-
-            # ── Permission negotiation + retry ──────────────
-            if not result.success and result.permission_request and permission_negotiator:
-                def log_permission_retry(retry_result: ToolResult) -> None:
-                    if logger:
-                        logger.log_tool_result(
-                            tool_name=fn_name,
-                            arguments=fn_args,
-                            result_success=retry_result.success,
-                            result_content=(
-                                retry_result.content if retry_result.success else None
-                            ),
-                            result_error=(
-                                retry_result.error if not retry_result.success else None
-                            ),
-                            raw_output=_trace_safe_tool_raw_output(retry_result.raw_output),
-                            tool_id=tool_id,
-                            server_name=server_name,
-                        )
-
-                result, policy_decision = await _negotiate_tool_permission_chain(
-                    result=result,
-                    permission_negotiator=permission_negotiator,
-                    tool_name=fn_name,
-                    tool=offered_tools_by_name.get(fn_name),
-                    arguments=fn_args,
-                    retry_offer_error=lambda: (
-                        f"Unknown tool: {fn_name}"
-                        if fn_name not in offered_tools_by_name
-                        else _tool_offer_error(fn_name)
-                    ),
-                    on_retry=log_permission_retry,
-                )
-            elif not result.success and result.permission_request:
-                policy_decision = _policy_decision_payload(
-                    tool_name=fn_name,
-                    permission_request=result.permission_request,
-                    decision="requested",
-                )
-
-            result = _persist_browser_snapshot_output(
-                result,
-                browser_snapshot_target,
-            )
-            result = _persist_browser_screenshot_output(
-                result,
-                browser_screenshot_target,
-            )
-            result = _activate_skill_result(fn_name, fn_args, result)
-            result, transient_blocks, transient_estimate = (
-                _validate_transient_followup_result(
-                    result=result,
-                    tool=offered_tools_by_name.get(fn_name),
-                    llm=llm,
-                    token_limit=token_limit,
-                    pending_token_estimate=pending_transient_followup_tokens,
-                )
-            )
-            if transient_blocks:
-                pending_transient_followup_blocks.extend(transient_blocks)
-                pending_transient_followup_tokens += transient_estimate
-            pending_model_history_recovery = (
-                _record_model_history_placeholder_recovery_result(
-                    pending_model_history_recovery,
-                    fn_name,
-                    fn_args,
-                    result,
-                )
-            )
-            tool_budget_state.record_delegated_tool_budget(fn_name, result.raw_output)
-            _record_search_files_result(fn_name, result)
-            step_tool_success_by_id[tc_id] = result.success
-            if result.success and fn_name == "plan_write":
-                plan_write_succeeded = True
-            if (
-                allowed_to_execute
-                and result.success
-                and getattr(
-                    offered_tools_by_name.get(fn_name),
-                    "ends_turn_on_success",
-                    False,
-                )
-            ):
-                completed_turn_ending_tool = fn_name
-
-            # Progress signal for the no-progress breaker: a successful tool
-            # call with non-empty content counts as making progress.
-            if (
-                result.success
-                and (result.content or "").strip()
-                and not search_files_result_is_empty(result)
-            ):
-                step_made_progress = True
-
-            # Hook: tool result (interceptor — may modify content/error)
-            tc_content = result.content
-            tc_error = result.error
-            if hook_mgr.hooks and tool_user_visible:
-                tc_content, tc_error = await hook_mgr.fire_tool_result(
-                    tool_call_id=tc_id, tool_name=fn_name,
-                    success=result.success, content=tc_content, error=tc_error,
-                )
-
-            outcome = process_tool_result(
-                ToolResultPipelineInput(
-                    messages=messages,
-                    tool_call_id=tc_id,
-                    tool_name=fn_name,
-                    arguments=fn_args,
-                    result=result,
-                    visible_content=tc_content,
-                    visible_error=tc_error,
-                    result_storage=result_storage,
-                    tool=tools.get(fn_name),
-                    session_id=session_id,
-                    resource_ledger=resource_ledger,
-                    web_search_seen_result_keys=web_search_seen_result_keys,
-                    framework_error_counts=model_history_framework_error_counts,
-                    user_visible=tool_user_visible,
-                    emit_legacy_permission_request=not permission_negotiator,
-                    policy_decision=policy_decision,
-                    tool_id=tool_id,
-                    server_name=server_name,
-                    turn_id=turn_id,
-                    step=step + 1,
-                    started_at=tool_started_at,
-                )
-            )
-            web_search_step_new_results += outcome.web_search_new_results
-            web_search_step_duplicate_results += outcome.web_search_duplicate_results
-            web_search_unique_results += outcome.web_search_new_results
-            web_search_duplicate_results += outcome.web_search_duplicate_results
-            if outcome.web_search_inspected:
-                web_search_step_structured_results += 1
-            web_search_step_labels.extend(outcome.web_search_labels[:3])
-            tc_content = outcome.visible_content
-            tc_error = outcome.visible_error
-            for event in outcome.events:
-                yield event
-
-            # Detect and yield structured artifacts (images, files) from tool output
-            if artifact_detection_enabled and result.success and workspace_dir:
-                post_files = _snapshot_workspace_signatures(
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-                for artifact in _detect_tool_artifacts(
-                    tc_id,
-                    fn_name,
-                    tc_content,
-                    result.raw_output,
-                    pre_files,
-                    post_files,
-                    workspace_dir,
-                    artifact_root_dir,
-                ):
-                    yield artifact
-
-            # Cancellation check after each tool
-            if cancelled():
-                _cleanup_incomplete_messages(messages)
-                if hook_mgr.hooks:
-                    await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
-                yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
-                return
-
-        # 2. Parallel execution for parallel_safe tools (e.g. generate_image, sub_agent)
-        if parallel_calls:
-            # Snapshot the workspace BEFORE any parallel tool runs. Per-tool
-            # snapshots are impossible under concurrency, so the diff layer uses
-            # one pre/post pair for the whole batch (see after the result loop).
-            par_pre_files: dict[Path, tuple[int, int]] = {}
-            if artifact_detection_enabled and workspace_dir:
-                par_pre_files = _snapshot_workspace_signatures(
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-            # Emit all ToolCallStart events and apply hook interceptors
-            par_args_map: dict[str, dict[str, Any]] = {}  # tc.id → (possibly modified) args
-            par_budget_errors: dict[str, str] = {}
-            par_user_visible: dict[str, bool] = {}
-            par_browser_snapshot_targets: dict[str, Path | None] = {}
-            par_browser_screenshot_targets: dict[str, Path | None] = {}
-            par_started_at: dict[str, float] = {}
-            durable_parallel_calls = False
-            for tc in parallel_calls:
-                par_fn_args = tc.function.arguments
-                (
-                    browser_snapshot_target,
-                    browser_snapshot_path_error,
-                ) = _prepare_browser_snapshot_output(
-                    tc.function.name,
-                    par_fn_args,
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-                par_browser_snapshot_targets[tc.id] = browser_snapshot_target
-                (
-                    browser_screenshot_target,
-                    browser_screenshot_path_error,
-                ) = _prepare_browser_screenshot_output(
-                    tc.function.name,
-                    par_fn_args,
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-                par_browser_screenshot_targets[tc.id] = browser_screenshot_target
-                browser_snapshot_path_error = (
-                    browser_snapshot_path_error or browser_screenshot_path_error
-                )
-                browser_intent_error = browser_intent_policy.tool_call_error(
-                    tc.function.name,
-                    par_fn_args,
-                )
-                offered_error = _tool_offer_error(tc.function.name)
-                placeholder_recovery_error = _model_history_placeholder_recovery_error(
-                    pending_model_history_recovery,
-                    tc.function.name,
-                    par_fn_args,
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-                if offered_error is not None:
-                    allowed_to_execute = False
-                    internal_skip_error = offered_error
-                elif browser_intent_error is not None:
-                    allowed_to_execute = False
-                    internal_skip_error = browser_intent_error
-                elif placeholder_recovery_error is not None:
-                    allowed_to_execute = False
-                    internal_skip_error = placeholder_recovery_error
-                elif browser_snapshot_path_error is not None:
-                    allowed_to_execute = False
-                    internal_skip_error = browser_snapshot_path_error
-                elif plan_approval_gate_active and tc.function.name != "plan_write":
-                    allowed_to_execute = False
-                    internal_skip_error = _PLAN_APPROVAL_SKIP_MESSAGE
-                elif tc.function.name == WEB_SEARCH_TOOL_NAME:
-                    allowed_to_execute, internal_skip_error = _reserve_web_search_call(par_fn_args)
-                else:
-                    allowed_to_execute, internal_skip_error = tool_budget_state.reserve(tc.function.name)
-                par_user_visible[tc.id] = allowed_to_execute
-                if allowed_to_execute and tc.function.name not in FINAL_SUMMARY_EXCLUDED_TOOLS:
-                    visible_tool_call_total += 1
-                tool_id, server_name = _tool_target_identity(tc.function.name)
-                yield ToolCallStart(
-                    tool_call_id=tc.id,
-                    tool_name=tc.function.name,
-                    arguments=par_fn_args,
-                    user_visible=allowed_to_execute,
-                    tool_id=tool_id,
-                    server_name=server_name,
-                )
-                if hook_mgr.hooks and allowed_to_execute:
-                    par_fn_args = await hook_mgr.fire_tool_start(
-                        tool_call_id=tc.id, tool_name=tc.function.name, arguments=par_fn_args,
-                    )
-                par_args_map[tc.id] = par_fn_args
-                par_started_at[tc.id] = perf_counter()
-                if (
-                    session_log is not None
-                    and session_turn is not None
-                    and allowed_to_execute
-                    and tc.function.name in offered_tools_by_name
-                ):
-                    session_log.append(
-                        "tool/call",
-                        {
-                            "turn": session_turn,
-                            "step": step + 1,
-                            "callId": tc.id,
-                            "name": tc.function.name,
-                            "arguments": par_fn_args,
-                        },
-                    )
-                    durable_parallel_calls = True
-                emit_session_trace(
-                    "tool.request",
-                    turn_id=turn_id,
-                    step=step + 1,
-                    tool_call_id=tc.id,
-                    data={
-                        "tool_name": tc.function.name,
-                        "tool_id": tool_id,
-                        "server_name": server_name,
-                        "arguments": par_fn_args,
-                        "allowed_to_execute": allowed_to_execute,
-                        "user_visible": allowed_to_execute,
-                        "parallel": True,
-                    },
-                )
-                if not allowed_to_execute:
-                    par_budget_errors[tc.id] = internal_skip_error or ""
-
-            if durable_parallel_calls and session_log is not None:
-                session_log.flush()
-
-            # Offer, policy, and budget decisions stay in core. The engine only
-            # schedules invocations or relays the immediate result prepared here.
-            parallel_requests: list[ToolInvocationRequest] = []
-            for tc in parallel_calls:
-                fn_name = tc.function.name
-                immediate_result: ToolResult | None = None
-                if tc.id in par_budget_errors:
-                    immediate_result = ToolResult(
-                        success=False,
-                        content="",
-                        error=par_budget_errors[tc.id],
-                    )
-                elif fn_name not in offered_tools_by_name:
-                    immediate_result = ToolResult(
-                        success=False,
-                        content="",
-                        error=f"Unknown tool: {fn_name}",
-                    )
-                elif current_offer_error := _tool_offer_error(fn_name):
-                    immediate_result = ToolResult(
-                        success=False,
-                        content="",
-                        error=current_offer_error,
-                    )
-                parallel_requests.append(
-                    ToolInvocationRequest(
-                        call_id=tc.id,
-                        tool_name=fn_name,
-                        arguments=par_args_map[tc.id],
-                        immediate_result=immediate_result,
-                    )
-                )
-
-            batch_completion: ToolBatchCompleted | None = None
-            async with aclosing(
-                tool_engine.invoke_parallel(parallel_requests)
-            ) as engine_events:
-                async for engine_record in engine_events:
-                    if isinstance(engine_record, ToolEngineProgress):
-                        yield engine_record.event
-                    elif isinstance(engine_record, ToolEngineActivity):
-                        yield LLMActivityEvent(
-                            step=step + 1,
-                            payload={
-                                "protocol": "agent_activity_v1",
-                                "phase": "tool_running",
-                                "tool_name": engine_record.tool_name,
-                            },
-                        )
-                    elif isinstance(engine_record, ToolBatchCompleted):
-                        batch_completion = engine_record
-
-            if batch_completion is None:
-                gathered = [
-                    (
-                        tc,
-                        ToolResult(
-                            success=False,
-                            content="",
-                            error=(
-                                "Tool execution interrupted — no result returned."
-                            ),
-                        ),
-                    )
-                    for tc in parallel_calls
-                ]
-            else:
-                gathered = [
-                    (parallel_calls[outcome.index], outcome.result)
-                    for outcome in batch_completion.outcomes
-                ]
-
-            # Accumulates absolute paths surfaced by the per-result regex layer
-            # (and artifact raw_outputs), so the single post-batch diff pass
-            # below doesn't re-emit them.
-            par_already_emitted: set[str] = set()
-
-            for tc, result in gathered:
-                tc_id = tc.id
-                fn_name = tc.function.name
-                fn_args = par_args_map[tc_id]
-                tool_id, server_name = _tool_target_identity(fn_name)
-                tool_user_visible = par_user_visible.get(tc_id, True)
-                policy_decision: dict[str, Any] | None = None
-
-                if plan_approval_gate_active and fn_name == "plan_write" and result.success:
-                    result = result.model_copy(
-                        update={
-                            "raw_output": _attach_plan_approval_payload(
-                                result.raw_output,
-                                request_id=plan_approval_request_id,
-                            )
-                        }
-                    )
-                    plan_approval_gate_completed = True
-
-                if logger:
-                    logger.log_tool_result(
-                        tool_name=fn_name,
-                        arguments=fn_args,
-                        result_success=result.success,
-                        result_content=result.content if result.success else None,
-                        result_error=result.error if not result.success else None,
-                        raw_output=_trace_safe_tool_raw_output(result.raw_output),
-                        tool_id=tool_id,
-                        server_name=server_name,
-                    )
-
-                # ── Permission negotiation + retry ──────────────
-                if not result.success and result.permission_request and permission_negotiator:
-                    def log_parallel_permission_retry(retry_result: ToolResult) -> None:
-                        if logger:
-                            logger.log_tool_result(
-                                tool_name=fn_name,
-                                arguments=fn_args,
-                                result_success=retry_result.success,
-                                result_content=(
-                                    retry_result.content if retry_result.success else None
-                                ),
-                                result_error=(
-                                    retry_result.error if not retry_result.success else None
-                                ),
-                                raw_output=_trace_safe_tool_raw_output(retry_result.raw_output),
-                                tool_id=tool_id,
-                                server_name=server_name,
-                            )
-
-                    result, policy_decision = await _negotiate_tool_permission_chain(
-                        result=result,
-                        permission_negotiator=permission_negotiator,
-                        tool_name=fn_name,
-                        tool=offered_tools_by_name.get(fn_name),
-                        arguments=fn_args,
-                        retry_offer_error=lambda: (
-                            f"Unknown tool: {fn_name}"
-                            if fn_name not in offered_tools_by_name
-                            else _tool_offer_error(fn_name)
-                        ),
-                        on_retry=log_parallel_permission_retry,
-                    )
-                elif not result.success and result.permission_request:
-                    policy_decision = _policy_decision_payload(
-                        tool_name=fn_name,
-                        permission_request=result.permission_request,
-                        decision="requested",
-                    )
-
-                result = _persist_browser_snapshot_output(
-                    result,
-                    par_browser_snapshot_targets.get(tc_id),
-                )
-                result = _persist_browser_screenshot_output(
-                    result,
-                    par_browser_screenshot_targets.get(tc_id),
-                )
-                result, transient_blocks, transient_estimate = (
-                    _validate_transient_followup_result(
-                        result=result,
-                        tool=offered_tools_by_name.get(fn_name),
-                        llm=llm,
-                        token_limit=token_limit,
-                        pending_token_estimate=pending_transient_followup_tokens,
-                    )
-                )
-                if transient_blocks:
-                    pending_transient_followup_blocks.extend(transient_blocks)
-                    pending_transient_followup_tokens += transient_estimate
-                tool_budget_state.record_delegated_tool_budget(fn_name, result.raw_output)
-                _record_search_files_result(fn_name, result)
-                step_tool_success_by_id[tc_id] = result.success
-                if result.success and fn_name == "plan_write":
-                    plan_write_succeeded = True
-
-                # Progress signal for the no-progress breaker.
-                if (
-                    result.success
-                    and (result.content or "").strip()
-                    and not search_files_result_is_empty(result)
-                ):
-                    step_made_progress = True
-
-                # Hook: tool result (interceptor)
-                par_content = result.content
-                par_error = result.error
-                if hook_mgr.hooks and tool_user_visible:
-                    par_content, par_error = await hook_mgr.fire_tool_result(
-                        tool_call_id=tc_id, tool_name=fn_name,
-                        success=result.success, content=par_content, error=par_error,
-                    )
-
-                outcome = process_tool_result(
-                    ToolResultPipelineInput(
-                        messages=messages,
-                        tool_call_id=tc_id,
-                        tool_name=fn_name,
-                        arguments=par_fn_args,
-                        result=result,
-                        visible_content=par_content,
-                        visible_error=par_error,
-                        result_storage=result_storage,
-                        tool=tools.get(fn_name),
-                        session_id=session_id,
-                        resource_ledger=resource_ledger,
-                        web_search_seen_result_keys=web_search_seen_result_keys,
-                        framework_error_counts=model_history_framework_error_counts,
-                        user_visible=tool_user_visible,
-                        emit_legacy_permission_request=not permission_negotiator,
-                        policy_decision=policy_decision,
-                        tool_id=tool_id,
-                        server_name=server_name,
-                        turn_id=turn_id,
-                        step=step + 1,
-                        started_at=par_started_at[tc_id],
-                        parallel=True,
-                    )
-                )
-                web_search_step_new_results += outcome.web_search_new_results
-                web_search_step_duplicate_results += (
-                    outcome.web_search_duplicate_results
-                )
-                web_search_unique_results += outcome.web_search_new_results
-                web_search_duplicate_results += outcome.web_search_duplicate_results
-                if outcome.web_search_inspected:
-                    web_search_step_structured_results += 1
-                web_search_step_labels.extend(outcome.web_search_labels[:3])
-                par_content = outcome.visible_content
-                par_error = outcome.visible_error
-                for event in outcome.events:
-                    yield event
-
-                # Artifact detection — layer 1 (regex) per result. The changed-file
-                # layer runs once after the loop (single batch snapshot).
-                if artifact_detection_enabled and result.success and tool_user_visible and workspace_dir:
-                    regex_artifacts, regex_already = _detect_regex_artifacts(
-                        tc_id, fn_name, par_content, result.raw_output,
-                        workspace_dir, artifact_root_dir,
-                    )
-                    for artifact in regex_artifacts:
-                        yield artifact
-                    par_already_emitted |= regex_already
-
-            # Artifact detection — layer 2 (diff), once for the whole batch.
-            # Concurrency rules out per-tool snapshots, so new files are
-            # attributed to the first parallel call's id.
-            if artifact_detection_enabled and workspace_dir and parallel_calls:
-                par_post_files = _snapshot_workspace_signatures(
-                    workspace_dir,
-                    artifact_root_dir,
-                )
-                for artifact in _detect_changed_files(
-                    parallel_calls[0].id,
-                    par_pre_files,
-                    par_post_files,
-                    par_already_emitted,
-                    workspace_dir,
-                ):
-                    yield artifact
-
-            # Cancellation check after all parallel results emitted — every
-            # tool message is now appended, so the message list is in a
-            # protocol-valid state for the next turn.
-            if cancelled():
-                _cleanup_incomplete_messages(messages)
-                if hook_mgr.hooks:
-                    await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
-                yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
-                return
-
-        # Reply to same-response duplicates without executing them. The source
-        # result is already present in the immediately preceding tool messages,
-        # so a compact reference is enough for the model and avoids duplicating
-        # large tool output in history.
-        for tc in duplicate_tool_calls:
-            duplicate_started_at = perf_counter()
-            source_id = duplicate_source_by_id[tc.id]
-            source_succeeded = step_tool_success_by_id.get(source_id)
-            if source_succeeded is True:
-                duplicate_content = (
-                    "Duplicate tool call skipped: identical call "
-                    f"{source_id} already executed successfully in this response. "
-                    "Reuse its result."
-                )
-                duplicate_error = None
-            elif source_succeeded is False:
-                duplicate_content = ""
-                duplicate_error = (
-                    "Duplicate tool call skipped: identical call "
-                    f"{source_id} already failed in this response. "
-                    "Fix that failure before retrying."
-                )
-            else:
-                duplicate_content = ""
-                duplicate_error = (
-                    "Duplicate tool call skipped because its identical source "
-                    f"call {source_id} did not produce a result."
-                )
-
-            tool_id, server_name = _tool_target_identity(tc.function.name)
-            yield ToolCallStart(
-                tool_call_id=tc.id,
-                tool_name=tc.function.name,
-                arguments=tc.function.arguments,
-                user_visible=False,
-                tool_id=tool_id,
-                server_name=server_name,
-            )
-            emit_session_trace(
-                "tool.request",
-                turn_id=turn_id,
-                step=step + 1,
-                tool_call_id=tc.id,
-                data={
-                    "tool_name": tc.function.name,
-                    "tool_id": tool_id,
-                    "server_name": server_name,
-                    "arguments": tc.function.arguments,
-                    "allowed_to_execute": False,
-                    "user_visible": False,
-                    "duplicate_of": source_id,
-                },
-            )
-            messages.append(
-                Message(
-                    role="tool",
-                    content=duplicate_content or duplicate_error or "",
-                    tool_call_id=tc.id,
-                    name=tc.function.name,
-                )
-            )
-            emit_session_trace(
-                "tool.response",
-                turn_id=turn_id,
-                step=step + 1,
-                tool_call_id=tc.id,
-                data={
-                    "tool_name": tc.function.name,
-                    "tool_id": tool_id,
-                    "server_name": server_name,
-                    "success": source_succeeded is True,
-                    "content": duplicate_content,
-                    "error": duplicate_error,
-                    "raw_output": None,
-                    "model_content": duplicate_content or duplicate_error or "",
-                    "policy_decision": None,
-                    "user_visible": False,
-                    "duplicate_of": source_id,
-                    "duration_ms": max(
-                        0,
-                        int((perf_counter() - duplicate_started_at) * 1000),
-                    ),
-                },
-            )
-            yield ToolCallResult(
-                tool_call_id=tc.id,
-                tool_name=tc.function.name,
-                success=source_succeeded is True,
-                content=duplicate_content,
-                error=duplicate_error,
-                raw_output=None,
-                user_visible=False,
-                policy_decision=None,
-                tool_id=tool_id,
-                server_name=server_name,
-            )
-
-        if model_history_placeholder_auto_repair_requested:
-            model_history_placeholder_repairs += 1
-            messages.append(
-                Message(
-                    role="user",
-                    content=format_injected_message(
-                        _MODEL_HISTORY_PLACEHOLDER_REPAIR_GUIDANCE
-                    ),
-                )
-            )
-            yield InjectedMessageEvent(
-                content=_MODEL_HISTORY_PLACEHOLDER_REPAIR_GUIDANCE,
-                injection_id=None,
-                user_visible=False,
-            )
+                    yield record
+        if cancelled():
+            _cleanup_incomplete_messages(messages)
+            if hook_mgr.hooks:
+                await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
+            yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
+            return
+        if tool_summary is None:
+            raise RuntimeError("Tool engine ended without a step summary")
+        step_made_progress = tool_summary.made_progress
+        visible_tool_call_total += tool_summary.visible_calls
+        completed_turn_ending_tool = tool_summary.completed_turn_ending_tool
+        plan_write_succeeded = plan_write_succeeded or "plan_write" in tool_summary.successful_tools
+        plan_approval_gate_completed = plan_approval_gate_completed or (
+            plan_approval_gate_active and "plan_write" in tool_summary.successful_tools
+        )
+        pending_transient_followup_blocks.extend(tool_summary.transient_blocks)
+        pending_transient_followup_tokens += tool_summary.transient_tokens
+        if tool_summary.repair_guidance:
+            messages.append(Message(role="user", content=format_injected_message(tool_summary.repair_guidance)))
+            yield InjectedMessageEvent(content=tool_summary.repair_guidance, injection_id=None, user_visible=False)
 
         if completed_turn_ending_tool is not None:
             elapsed = perf_counter() - step_start
@@ -3719,54 +2410,9 @@ async def _run_agent_loop_impl(
             )
             return
 
-        if web_search_step_seen:
-            if web_search_step_executed > 0 and web_search_step_structured_results > 0:
-                if web_search_step_new_results == 0:
-                    web_search_no_new_batches += 1
-                else:
-                    web_search_no_new_batches = 0
-
-            total_web_search_calls = tool_budget_state.tool_call_counts.get(WEB_SEARCH_TOOL_NAME, 0)
-            guidance_lines = [
-                "Search batch controller update (internal; do not mention this controller to the user):",
-                (
-                    f"- Executed this batch: {web_search_step_executed}; "
-                    f"total executed this turn: {total_web_search_calls}/{web_search_total_limit}; "
-                    f"batch size: {web_search_batch_size}."
-                ),
-            ]
-            if web_search_step_deferred:
-                guidance_lines.append(f"- Deferred this batch: {web_search_step_deferred}.")
-            if web_search_step_duplicate_queries:
-                guidance_lines.append(f"- Duplicate queries skipped this batch: {web_search_step_duplicate_queries}.")
-            if web_search_step_structured_results:
-                guidance_lines.append(
-                    f"- New structured results this batch: {web_search_step_new_results}; "
-                    f"duplicate structured results this batch: {web_search_step_duplicate_results}; "
-                    f"unique structured results this turn: {web_search_unique_results}; "
-                    f"duplicates filtered this turn: {web_search_duplicate_results}."
-                )
-            if web_search_step_labels:
-                examples = "; ".join(web_search_step_labels[:5])
-                guidance_lines.append(f"- New result examples: {examples}.")
-            if total_web_search_calls >= web_search_total_limit:
-                guidance_lines.append(
-                    "- The web_search total limit has been reached. Do not call web_search again; "
-                    "synthesize the final answer from gathered evidence and briefly mark gaps."
-                )
-            elif web_search_no_new_batches >= 2:
-                guidance_lines.append(
-                    "- Two consecutive structured search batches added no new results. Stop searching unless "
-                    "a critical first-party source is still missing."
-                )
-            else:
-                guidance_lines.append(
-                    f"- Before searching again, inspect the deduped evidence. If gaps remain, issue at most "
-                    f"{web_search_batch_size} new, specific, non-duplicate web_search queries."
-                )
-            guidance_text = "\n".join(guidance_lines)
-            messages.append(Message(role="user", content=format_injected_message(guidance_text)))
-            yield InjectedMessageEvent(content=guidance_text, injection_id=None, user_visible=False)
+        if tool_summary.search_guidance:
+            messages.append(Message(role="user", content=format_injected_message(tool_summary.search_guidance)))
+            yield InjectedMessageEvent(content=tool_summary.search_guidance, injection_id=None, user_visible=False)
 
         if (
             visible_tool_call_total > final_summary_after_calls
@@ -3858,6 +2504,19 @@ class AgentLoopKernel:
             )
         self._runtime_defaults = _runtime_defaults
         self._run_arguments = dict(run_arguments)
+        if _services.tool_engine is None:
+            # Legacy callers may still construct the original service bundle.
+            # Resolve the default once at the run boundary, never per step.
+            from ..tools.engine.engine import DefaultToolEngine
+
+            _services = replace(
+                _services,
+                tool_engine=DefaultToolEngine(
+                    tools=_services.tool_catalog,
+                    tool_exposure=_services.tool_exposure,
+                    tool_result_store=_services.tool_result_store,
+                ),
+            )
         self._services = _services
 
     async def run(self) -> AsyncIterator[AgentEvent]:
@@ -3872,6 +2531,8 @@ class AgentLoopKernel:
                 yield event
         finally:
             await events.aclose()
+            if self._services.tool_engine is not None:
+                await self._services.tool_engine.aclose()
 
 
 async def run_agent_loop(

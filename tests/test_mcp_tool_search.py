@@ -934,7 +934,7 @@ async def test_agent_wires_search_and_child_inheritance_to_session_visibility(
         catalog.clear()
 
 
-def test_agent_explicit_legacy_mode_keeps_existing_eager_behavior(tmp_path) -> None:
+def test_agent_explicit_legacy_mode_keeps_mcp_eager_with_local_discovery(tmp_path) -> None:
     tool = FakeMCPTool("lookup", "crm", "Lookup")
     agent = Agent(
         llm_client=object(),
@@ -944,8 +944,10 @@ def test_agent_explicit_legacy_mode_keeps_existing_eager_behavior(tmp_path) -> N
         deferred_mcp_loading_enabled=False,
     )
 
-    assert "tool_search" not in agent.tools
+    assert "tool_search" in agent.tools
     assert agent._inherited_tools()["lookup"] is tool
+    exposure = agent.mcp_tool_exposure.prepare_tools(list(agent.tools.values()))
+    assert exposure.offered_names == frozenset({"lookup", "tool_search"})
 
 
 def test_late_mcp_registration_cannot_replace_session_search_control() -> None:

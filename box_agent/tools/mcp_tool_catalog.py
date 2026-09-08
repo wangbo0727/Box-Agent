@@ -223,8 +223,10 @@ class MCPToolCatalog:
         *,
         server_name: str | None = None,
         top_k: int = 5,
+        entries: Iterable[MCPToolEntry] | None = None,
     ) -> list[MCPToolEntry]:
         """Merge independent keyword searches using each tool's best rank."""
+        search_entries = tuple(entries) if entries is not None else None
         normalized_queries: list[str] = []
         seen_queries: set[str] = set()
         for query in queries:
@@ -240,7 +242,7 @@ class MCPToolCatalog:
         ] = {}
         for query_index, query in enumerate(normalized_queries):
             for exact_priority, neg_relevance, neg_matched, tool_id, entry in (
-                self._ranked_search(query, server_name=server_name)
+                self._ranked_search(query, server_name=server_name, entries=search_entries)
             ):
                 candidate = (
                     exact_priority,
@@ -302,16 +304,19 @@ class MCPToolCatalog:
         query: str,
         *,
         server_name: str | None = None,
+        entries: Iterable[MCPToolEntry] | None = None,
     ) -> list[tuple[int, float, int, str, MCPToolEntry]]:
         normalized_query = _normalize(query)
         query_terms = tuple(dict.fromkeys(_tokenize(query)))
         if not normalized_query or not query_terms:
             return []
         documents = []
-        for entry in self.snapshot():
+        for entry in self.snapshot() if entries is None else entries:
             if server_name and entry.server_name != server_name:
                 continue
-            model_terms = tuple(dict.fromkeys(_tokenize(entry.model_name)))
+            aliases = tuple(getattr(entry.tool, "aliases", ()))
+            names = (entry.model_name, *aliases)
+            model_terms = tuple(dict.fromkeys(_tokenize(" ".join(names))))
             model_term_set = set(model_terms)
             server_terms = tuple(
                 term
@@ -321,7 +326,7 @@ class MCPToolCatalog:
             documents.append(
                 (
                     entry,
-                    _normalize(entry.model_name),
+                    tuple(_normalize(name) for name in names),
                     _normalize(entry.tool_id),
                     _normalize(f"{entry.server_name} {entry.model_name}"),
                     model_terms,
@@ -353,7 +358,7 @@ class MCPToolCatalog:
         ranked: list[tuple[int, float, int, str, MCPToolEntry]] = []
         for (
             entry,
-            normalized_name,
+            normalized_names,
             normalized_id,
             normalized_server_name,
             model_name_terms,
@@ -361,13 +366,13 @@ class MCPToolCatalog:
             description_terms,
         ) in documents:
             exact_priority = 3
-            if normalized_query == normalized_name:
+            if normalized_query in normalized_names:
                 exact_priority = 0
             elif normalized_query == normalized_id:
                 exact_priority = 1
             elif normalized_query == normalized_server_name:
                 exact_priority = 2
-            elif len(normalized_name) >= 3 and normalized_name in normalized_query:
+            elif any(len(name) >= 3 and name in normalized_query for name in normalized_names):
                 # Preserve main's compound-query behavior: when the model names
                 # a concrete tool inside a longer request, rank that explicit
                 # selection ahead of fuzzy BM25 matches.

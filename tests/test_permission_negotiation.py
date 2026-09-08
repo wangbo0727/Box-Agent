@@ -1020,3 +1020,267 @@ class TestSafetyPermissionNegotiation:
         results = [e for e in events if isinstance(e, ToolCallResult)]
         assert len(results) == 1
         assert results[0].success is True
+
+
+@pytest.mark.asyncio
+async def test_direct_permission_retries_forward_live_events_without_reading_parent_queue():
+    from box_agent.tools.base import EventEmittingTool, ToolInvocationContext
+
+    class OutputOnlyQueue(asyncio.Queue):
+        def get_nowait(self):
+            raise AssertionError("the parent queue is an output sink")
+
+        async def get(self):
+            raise AssertionError("the parent queue is an output sink")
+
+    class ProgressTool(EventEmittingTool, TwoGateTool):
+        def __init__(self):
+            EventEmittingTool.__init__(self)
+            TwoGateTool.__init__(self)
+            self.contexts = []
+            self.release = asyncio.Event()
+            self.effects = 0
+
+        async def execute(self):
+            self.contexts.append(self._parent_tool_call_id)
+            if len(self.approved_requests) == len(self.requests):
+                self._event_queue.put_nowait({"phase": "approved-running"})
+                await self.release.wait()
+                self.effects += 1
+            return await TwoGateTool.execute(self)
+
+    tool = ProgressTool()
+    queue = OutputOnlyQueue()
+    sibling_event = {"phase": "sibling"}
+    queue.put_nowait(sibling_event)
+    context = ToolInvocationContext(event_queue=queue, parent_tool_call_id="parent-1")
+    task = asyncio.create_task(invoke_tool_with_permissions(
+        tool, {}, permission_negotiator=SafetyNegotiator(grant=True),
+        invocation_context=context,
+    ))
+    try:
+        for _ in range(100):
+            if task.done() or queue.qsize() == 2:
+                break
+            await asyncio.sleep(0.005)
+        if task.done():
+            await task
+        assert queue.qsize() == 2
+        assert not task.done(), "progress must arrive before the approved attempt finishes"
+    finally:
+        tool.release.set()
+        result, decision = await asyncio.wait_for(task, 1)
+    assert result.success
+    assert decision["retry_count"] == 2
+    assert tool.effects == 1
+    assert tool.contexts == ["parent-1"] * 3
+    assert asyncio.Queue.get_nowait(queue) is sibling_event
+    assert asyncio.Queue.get_nowait(queue) == {"phase": "approved-running"}
+
+
+@pytest.mark.asyncio
+async def test_permission_negotiation_durability_error_propagates():
+    from box_agent.kernel.permission_gateway import _negotiate_tool_permission_chain
+
+    failure = SessionLogDurabilityError("cannot persist approval")
+
+    class FailingNegotiator:
+        async def negotiate(self, request):
+            raise failure
+
+    tool = TwoGateTool()
+    result = await tool.invoke({})
+    with pytest.raises(SessionLogDurabilityError) as caught:
+        await _negotiate_tool_permission_chain(
+            result=result, permission_negotiator=FailingNegotiator(),
+            tool_name=tool.name, tool=tool, arguments={}, retry_offer_error=lambda: None,
+        )
+    assert caught.value is failure
+    assert tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_invocation_cancel_context_stops_approved_event_attempt():
+    from box_agent.tools.base import EventEmittingTool, ToolInvocationContext
+
+    class CancellableTool(EventEmittingTool, TwoGateTool):
+        cancel_on_agent_cancel = True
+
+        def __init__(self):
+            EventEmittingTool.__init__(self)
+            TwoGateTool.__init__(self)
+            self.requests = self.requests[:1]
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def execute(self):
+            if not self.approved_requests:
+                return await TwoGateTool.execute(self)
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.stopped.set()
+
+    tool = CancellableTool()
+    result, decision = await asyncio.wait_for(invoke_tool_with_permissions(
+        tool, {}, permission_negotiator=SafetyNegotiator(grant=True),
+        invocation_context=ToolInvocationContext(parent_tool_call_id="cancel-1"),
+        is_cancelled=tool.started.is_set,
+    ), 1)
+    assert not result.success
+    assert "cancelled" in result.error
+    assert decision["retry_count"] == 1
+    assert tool.stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_permission_stream_relays_progress_and_activity_before_final_result():
+    from box_agent.tools.base import EventEmittingTool, ToolInvocationContext
+    from box_agent.tools.engine.execution import (
+        PermissionChainCompleted, stream_tool_permission_chain,
+    )
+    from box_agent.tools.engine.scheduler import (
+        ToolEngine, ToolEngineActivity, ToolEngineProgress, ToolInvocationRequest,
+    )
+
+    class StreamingTool(EventEmittingTool, TwoGateTool):
+        def __init__(self):
+            EventEmittingTool.__init__(self)
+            TwoGateTool.__init__(self)
+            self.requests = self.requests[:1]
+            self.release = asyncio.Event()
+            self.finished = False
+
+        async def execute(self):
+            if self.approved_requests:
+                self._event_queue.put_nowait(self._parent_tool_call_id)
+                await self.release.wait()
+                self.finished = True
+            return await TwoGateTool.execute(self)
+
+    tool = StreamingTool()
+    first_result = await tool.invoke({})
+    scheduler = ToolEngine(
+        tools={tool.name: tool}, is_cancelled=lambda: False,
+        activity_interval_seconds=0.005, event_poll_interval_seconds=0.001,
+        cancel_grace_seconds=0.02, max_parallel_tools=1,
+        batch_timeout_seconds=None, web_search_concurrency=1,
+        web_search_tool_name="web_search",
+    )
+    request = ToolInvocationRequest(
+        call_id="original-call", tool_name=tool.name, arguments={},
+        invocation_context=ToolInvocationContext(parent_tool_call_id="original-parent"),
+    )
+    retried = []
+    stream = stream_tool_permission_chain(
+        result=first_result, permission_negotiator=SafetyNegotiator(grant=True),
+        tool_name=tool.name, tool=tool, arguments={}, retry_offer_error=lambda: None,
+        retry_records=lambda: scheduler.invoke_serial(request), on_retry=retried.append,
+    )
+    try:
+        assert await asyncio.wait_for(anext(stream), 0.5) == ToolEngineProgress(event="original-parent")
+        assert not tool.finished
+        assert await asyncio.wait_for(anext(stream), 0.5) == ToolEngineActivity(tool_name=tool.name)
+        assert not tool.finished
+        tool.release.set()
+        remaining = [record async for record in stream]
+    finally:
+        tool.release.set()
+        await stream.aclose()
+    final = remaining[-1]
+    assert isinstance(final, PermissionChainCompleted)
+    assert sum(isinstance(record, PermissionChainCompleted) for record in remaining) == 1
+    assert final.result.success
+    assert retried == [final.result]
+    assert tool.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["repeated", "limit", "denied", "error", "no_negotiator"])
+async def test_direct_permission_chain_retains_bounded_terminal_decisions(mode):
+    class GatedTool(TwoGateTool):
+        async def execute(self):
+            self.call_count += 1
+            index = 0 if mode == "repeated" else len(self.approved_requests)
+            return ToolResult(success=False, error="approval required", permission_request={
+                "scope": "filesystem", "requested_scope": f"gate-{index}",
+            })
+
+    class Negotiator(SafetyNegotiator):
+        async def negotiate(self, request):
+            if mode == "error":
+                self.requests.append(request)
+                raise RuntimeError("host unavailable")
+            return await super().negotiate(request)
+
+    tool = GatedTool()
+    negotiator = Negotiator(grant=mode != "denied")
+    result, decision = await invoke_tool_with_permissions(
+        tool, {}, permission_negotiator=None if mode == "no_negotiator" else negotiator,
+    )
+    assert not result.success
+    if mode == "no_negotiator":
+        assert decision is None
+        assert tool.call_count == 1
+        return
+    retries = {"repeated": 1, "limit": 4, "denied": 0, "error": 0}[mode]
+    assert decision["retry_count"] == retries
+    assert tool.call_count == retries + 1
+    assert len(tool.approved_requests) == retries
+    assert decision["decision"] == ("denied" if mode == "denied" else "error")
+    if mode == "repeated":
+        assert decision["error"] == "Permission request repeated after approval"
+    elif mode == "limit":
+        assert decision["error"] == "Permission retry limit reached"
+    elif mode == "error":
+        assert decision["error"] == "host unavailable"
+
+
+@pytest.mark.asyncio
+async def test_permission_wrapper_revalidates_after_approval_before_consuming_grant():
+    from box_agent.kernel.permission_gateway import _negotiate_tool_permission_chain
+
+    tool = TwoGateTool()
+    first_result = await tool.invoke({})
+    negotiator = SafetyNegotiator(grant=True)
+    retried = []
+
+    def validate_offer():
+        assert negotiator.requests == [tool.requests[0]]
+        return "tool offer became stale"
+
+    result, decision = await _negotiate_tool_permission_chain(
+        result=first_result, permission_negotiator=negotiator,
+        tool_name=tool.name, tool=tool, arguments={},
+        retry_offer_error=validate_offer, on_retry=retried.append,
+    )
+    assert not result.success
+    assert result.error == "tool offer became stale"
+    assert tool.call_count == 1
+    assert tool.approved_requests == []
+    assert retried == [result]
+    assert decision["decision"] == "approved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_approval", [False, True])
+async def test_direct_invocation_preserves_ordinary_exception_payloads(after_approval):
+    class ExplodingTool(TwoGateTool):
+        async def execute(self):
+            if after_approval and not self.approved_requests:
+                return await TwoGateTool.execute(self)
+            raise ValueError("broken fixture")
+
+    result, decision = await invoke_tool_with_permissions(
+        ExplodingTool(), {}, permission_negotiator=SafetyNegotiator(grant=True),
+    )
+    assert not result.success
+    if after_approval:
+        assert result.error.startswith("Tool execution failed: ValueError: broken fixture\n\nTraceback:")
+        assert result.raw_output is None
+        assert decision["retry_count"] == 1
+    else:
+        assert result.error == "Tool execution failed: ValueError: broken fixture"
+        assert result.raw_output == {"type": "tool_error", "code": "TOOL_EXECUTION_FAILED", "tool": "two_gates"}
+        assert decision is None

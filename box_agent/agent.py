@@ -36,7 +36,6 @@ from .events import (
     SummarizationEvent,
     ThinkingEvent,
     TokenUsageEvent,
-    ToolCallResult,
     ToolCallStart,
 )
 from .context_resources import ContextResourceLedger
@@ -47,7 +46,8 @@ from .runtime import run_agent_loop
 from .schema import Message
 from .session_log import SessionLog
 from .tools.base import Tool, ToolResult, build_tool_name_index
-from .tools.mcp_tool_catalog import get_mcp_tool_catalog
+from .tools.local_tool_exposure import LocalToolExposurePolicy
+from .tools.mcp_tool_catalog import MCPToolCatalog, get_mcp_tool_catalog
 from .tools.mcp_tool_search import (
     ActivatedMCPTool,
     MCPToolExposureManager,
@@ -478,20 +478,34 @@ class Agent:
         self.context_resource_dedup_enabled = context_resource_dedup_enabled
         self.context_resource_ledger = ContextResourceLedger()
         self.activated_mcp_tools: OrderedDict[str, ActivatedMCPTool] = OrderedDict()
-        self.mcp_tool_exposure: MCPToolExposureManager | None = None
-        if deferred_mcp_loading_enabled:
-            catalog = get_mcp_tool_catalog()
-            self.mcp_tool_exposure = MCPToolExposureManager(
-                catalog,
-                self.activated_mcp_tools,
-            )
-            self.tools["tool_search"] = ToolSearchTool(
-                catalog,
-                self.activated_mcp_tools,
-                protected_names_provider=lambda: frozenset(
-                    build_tool_name_index(self.tools.values())
-                ),
-            )
+        self.activated_local_tools: OrderedDict[str, Tool] = OrderedDict()
+        self.local_tool_exposure = LocalToolExposurePolicy(
+            lambda: self.tools,
+            goal_provider=lambda: getattr(self, "goal", None),
+            active_skills_provider=lambda: getattr(self, "_active_skill_prompts", {}),
+        )
+        # Eager MCP remains eager. Its local discovery uses an isolated empty
+        # catalog so a process-global deferred server cannot leak into this mode.
+        catalog = get_mcp_tool_catalog() if deferred_mcp_loading_enabled else MCPToolCatalog()
+        self.mcp_tool_exposure: MCPToolExposureManager | None = MCPToolExposureManager(
+            catalog,
+            self.activated_mcp_tools,
+            activated_local_tools=self.activated_local_tools,
+            deferred_local_names_provider=self.local_tool_exposure.deferred_names,
+            deferred_mcp=deferred_mcp_loading_enabled,
+        )
+        self.tools["tool_search"] = ToolSearchTool(
+            catalog,
+            self.activated_mcp_tools,
+            protected_names_provider=lambda: frozenset(
+                build_tool_name_index(
+                    tool for tool in self.tools.values()
+                    if getattr(tool, "mcp_tool_id", None) is None
+                )
+            ),
+            local_tools_provider=self.local_tool_exposure.candidate_tools,
+            activated_local_tools=self.activated_local_tools,
+        )
         self.tool_result_storage = ToolResultStorage(
             state_path('sessions')
         )
@@ -525,8 +539,11 @@ class Agent:
 
         if self.mcp_tool_exposure is not None:
             system_prompt = (
-                f"{system_prompt.rstrip()}\n\n## Deferred MCP tools\n"
+                f"{system_prompt.rstrip()}\n\n## Discoverable tools\n"
                 "Use `tool_search` when the visible tools do not cover the task. "
+                "Allowed local utilities include file append, diagnostics, plans, "
+                "progress, goals, memory, scheduling and integrations; connected "
+                "deferred MCP capabilities are searchable through the same entry. "
                 "Every returned match is activated for this session; only those matches "
                 "are added by their real tool name on the next step, while unreturned "
                 "deferred tools remain hidden. Tools explicitly configured as alwaysLoad "
@@ -549,9 +566,9 @@ class Agent:
         for tool in self.tools.values():
             if hasattr(tool, "set_parent_system_prompt"):
                 tool.set_parent_system_prompt(system_prompt)
-            # Give sub-agents a live view of the parent's currently visible real
-            # tools. Deferred MCP discovery stays parent-owned; once activated,
-            # a real MCP tool becomes inheritable without exposing tool_search.
+            # Give sub-agents the allowed local map and activated/eager MCP tools.
+            # Parent schema visibility must not remove delegated local capability;
+            # deferred MCP discovery still stays parent-owned.
             if hasattr(tool, "set_tool_provider"):
                 tool.set_tool_provider(self._inherited_tools)
             if session_log is not None and hasattr(tool, "set_parent_session_log"):
@@ -1008,6 +1025,10 @@ class Agent:
         if legacy_overrides:
             effective_options = replace(effective_options, **legacy_overrides)
 
+        if (effective_options.force_plan_start or effective_options.require_plan_approval
+                or effective_options.pause_after_plan_write):
+            self.local_tool_exposure.require_tools(("plan_read", "plan_write"))
+
         sub_agent_tool = self.tools.get("sub_agent")
         set_child_negotiator = getattr(
             sub_agent_tool,
@@ -1111,20 +1132,6 @@ class Agent:
                             {"turn": session_turn, "step": session_step},
                         )
                         session_step_open = True
-                    elif isinstance(event, ToolCallResult):
-                        self._persist_unlogged_messages(
-                            turn=session_turn,
-                            step=session_step,
-                            tool_result_metadata={
-                                event.tool_call_id: {
-                                    "success": event.success,
-                                    "content": event.content,
-                                    "error": event.error,
-                                    "rawOutput": event.raw_output,
-                                    "policyDecision": event.policy_decision,
-                                }
-                            },
-                        )
                     elif isinstance(event, StepEnd):
                         self._persist_unlogged_messages(
                             turn=session_turn,

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from ..schema import LLMResponse, Message, StreamEvent
 from ..tools.base import Tool
+
+if TYPE_CHECKING:
+    from ..events import AgentEvent
+    from ..schema import ToolCall
+    from ..tools.engine.call_contracts import ToolExecutionOptions, ToolRunContext, ToolStepControl, ToolStepSummary
+    from ..tools.engine.contracts import PreparedTools
 
 
 @runtime_checkable
@@ -276,6 +282,27 @@ class ToolResultBudgetOutcomePort(Protocol):
     remaining_chars: int
 
 
+@runtime_checkable
+class ToolEnginePort(Protocol):
+    """Per-run tool orchestration over borrowed session resources."""
+
+    def prepare_tools(
+        self,
+        *,
+        is_tool_visible: Callable[[str], bool] | None = None,
+    ) -> "PreparedTools": ...
+
+    def configure_run(self, context: ToolRunContext, options: ToolExecutionOptions) -> None: ...
+
+    def budget_guidance(self) -> list[str]: ...
+
+    def execute_calls(
+        self, prepared: PreparedTools, calls: list[ToolCall], control: ToolStepControl,
+    ) -> AsyncIterator[AgentEvent | ToolStepSummary]: ...
+
+    async def aclose(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class KernelServices:
     """Resolved per-run capabilities consumed directly by the kernel."""
@@ -291,6 +318,7 @@ class KernelServices:
     tool_catalog: ToolCatalogPort
     tool_exposure: ToolExposurePort | None
     tool_result_store: ToolResultStorePort | None
+    tool_engine: ToolEnginePort | None = None
 
 
 __all__ = [
@@ -306,6 +334,7 @@ __all__ = [
     "ToolCatalogPort",
     "ToolExposureResultPort",
     "ToolExposurePort",
+    "ToolEnginePort",
     "ToolResultBudgetOutcomePort",
     "ToolResultStorePort",
 ]

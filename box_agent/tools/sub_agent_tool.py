@@ -34,8 +34,8 @@ from ..events import (
 )
 from ..llm.model_routing import resolve_model_client
 from ..schema import Message
-from ..session_log import SessionLog
-from .base import EventEmittingTool, Tool, ToolResult
+from ..session_log import SessionLog, SessionLogDurabilityError
+from .base import EventEmittingTool, Tool, ToolInvocationContext, ToolResult
 from .schema_validation import ToolArgumentIssue
 from .safety import detect_dangerous_command
 from .skill_preload import strip_active_skills, strip_auto_loaded_skills
@@ -50,7 +50,7 @@ from .sub_agent_capabilities import (
     parse_delegation_spec,
 )
 
-_DEFERRED_MCP_HEADING = "## Deferred MCP tools\n"
+_DEFERRED_MCP_HEADINGS = ("## Deferred MCP tools\n", "## Discoverable tools\n")
 _CHILD_MCP_BOUNDARY = (
     "## Inherited MCP capability boundary\n"
     "The parent agent owns deferred MCP discovery. Use only the real MCP tools "
@@ -65,13 +65,17 @@ def _child_safe_parent_prompt(system_prompt: str) -> str:
     # explicitly for the child or supplied as task input; inheriting them again
     # can exceed the child's smaller safe context before its first useful step.
     system_prompt = strip_active_skills(strip_auto_loaded_skills(system_prompt))
-    heading_index = system_prompt.find(_DEFERRED_MCP_HEADING)
-    if heading_index < 0:
+    headings = [
+        (system_prompt.find(heading), heading) for heading in _DEFERRED_MCP_HEADINGS
+        if heading in system_prompt
+    ]
+    if not headings:
         return system_prompt
+    heading_index, heading = min(headings)
     section_start = heading_index
     if system_prompt[max(0, heading_index - 2) : heading_index] == "\n\n":
         section_start = heading_index - 2
-    next_section = system_prompt.find("\n\n## ", heading_index + len(_DEFERRED_MCP_HEADING))
+    next_section = system_prompt.find("\n\n## ", heading_index + len(heading))
     suffix = system_prompt[next_section:] if next_section >= 0 else ""
     return f"{system_prompt[:section_start].rstrip()}\n\n{_CHILD_MCP_BOUNDARY}{suffix}"
 
@@ -394,24 +398,20 @@ class SubAgentTool(EventEmittingTool):
         self,
         tool: Tool,
         arguments: dict[str, Any],
+        *,
+        invocation_context: ToolInvocationContext | None = None,
     ) -> ToolResult:
-        """Invoke a directly-called child tool and retry once after approval."""
-        result = await tool.invoke(arguments)
-        if (
-            result.success
-            or not result.permission_request
-            or self._permission_negotiator is None
-        ):
-            return result
-        try:
-            granted = await self._permission_negotiator.negotiate(
-                result.permission_request
-            )
-        except Exception:
-            granted = False
-        if not granted:
-            return result
-        return await tool.invoke(arguments)
+        """Use the public standalone execution boundary for direct child calls."""
+        # Runtime also composes sub-agents; import only when executing a child.
+        from ..runtime import invoke_tool_with_permissions
+
+        result, _policy_decision = await invoke_tool_with_permissions(
+            tool,
+            arguments,
+            permission_negotiator=self._permission_negotiator,
+            invocation_context=invocation_context,
+        )
+        return result
 
     @property
     def name(self) -> str:
@@ -981,7 +981,13 @@ class SubAgentTool(EventEmittingTool):
                 return path, await self._invoke_with_permission_retry(
                     read_tool,
                     {"path": path},
+                    invocation_context=ToolInvocationContext(
+                        event_queue=queue,
+                        parent_tool_call_id=parent_tool_call_id,
+                    ),
                 )
+            except SessionLogDurabilityError:
+                raise
             except Exception as exc:
                 # Keep one ordinary read failure from cancelling siblings.
                 # asyncio.CancelledError is a BaseException and still propagates.

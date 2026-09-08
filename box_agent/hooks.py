@@ -33,6 +33,7 @@ import sys
 from typing import Any
 
 from box_agent.user_paths import state_path
+from box_agent.session_log import SessionLogDurabilityError
 
 log = logging.getLogger(__name__)
 
@@ -232,6 +233,8 @@ class HookManager:
                 )
                 if result is not None:
                     current_args = result
+            except SessionLogDurabilityError:
+                raise
             except Exception as exc:
                 log.warning("Hook %s.on_tool_start failed: %s", type(hook).__name__, exc)
         return current_args
@@ -262,6 +265,8 @@ class HookManager:
                 )
                 if result is not None:
                     current_content, current_error = result
+            except SessionLogDurabilityError:
+                raise
             except Exception as exc:
                 log.warning("Hook %s.on_tool_result failed: %s", type(hook).__name__, exc)
         return current_content, current_error

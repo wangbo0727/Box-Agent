@@ -13,6 +13,7 @@ from ..kernel.ports import (
     SessionStorePort,
     SummaryLLMPort,
     ToolCatalogPort,
+    ToolEnginePort,
     ToolExposurePort,
     ToolResultStorePort,
 )
@@ -39,6 +40,7 @@ DEFAULT_CAPABILITY_SCHEMA = CapabilitySchema(
         CapabilityBinding(ToolCatalogPort, CapabilityPolicy.REQUIRED_SINGLE),
         CapabilityBinding(ToolExposurePort, CapabilityPolicy.OPTIONAL_SINGLE),
         CapabilityBinding(ToolResultStorePort, CapabilityPolicy.OPTIONAL_SINGLE),
+        CapabilityBinding(ToolEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
     )
 )
 
@@ -73,6 +75,7 @@ def default_plugin_descriptors(
     tool_catalog: ToolCatalogPort,
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
+    tool_engine: ToolEnginePort | None = None,
 ) -> tuple[PluginDescriptor, ...]:
     """Return deterministic descriptors for the supplied runtime instances."""
 
@@ -103,6 +106,7 @@ def default_plugin_descriptors(
             tool_result_store,
             True,
         ),
+        ("default.tool-engine", ToolEnginePort, tool_engine, True),
     )
     return tuple(
         _captured_instance_descriptor(plugin_id, port_type, instance)
@@ -124,6 +128,7 @@ def create_default_plugin_host(
     tool_catalog: ToolCatalogPort,
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
+    tool_engine: ToolEnginePort | None = None,
 ) -> PluginHost:
     """Create a fresh static host for one outer agent-loop run."""
 
@@ -140,6 +145,7 @@ def create_default_plugin_host(
             tool_catalog=tool_catalog,
             tool_exposure=tool_exposure,
             tool_result_store=tool_result_store,
+            tool_engine=tool_engine,
         ),
         schema=DEFAULT_CAPABILITY_SCHEMA,
     )
@@ -160,6 +166,7 @@ def kernel_services_from_registry(registry: ActivatedRegistry) -> KernelServices
         tool_catalog=registry.require(ToolCatalogPort),
         tool_exposure=registry.get(ToolExposurePort),
         tool_result_store=registry.get(ToolResultStorePort),
+        tool_engine=registry.get(ToolEnginePort),
     )
 
 
@@ -176,6 +183,7 @@ def compose_default_services(
     tool_catalog: ToolCatalogPort,
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
+    tool_engine: ToolEnginePort | None = None,
 ) -> KernelServices:
     """Return one immutable bundle without discovery, I/O, or object creation."""
 
@@ -191,6 +199,7 @@ def compose_default_services(
         tool_catalog=tool_catalog,
         tool_exposure=tool_exposure,
         tool_result_store=tool_result_store,
+        tool_engine=tool_engine,
     )
 
 

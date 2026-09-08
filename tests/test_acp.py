@@ -972,6 +972,15 @@ class TodoLLM:
         self.calls = 0
 
     async def generate_stream(self, messages, tools, **_):
+        if "todo_write" not in {tool.name for tool in tools}:
+            yield StreamEvent(
+                type="finish", finish_reason="tool_use", tool_calls=[ToolCall(
+                    id="discover-todo", type="function", function=FunctionCall(
+                        name="tool_search", arguments={"tool_names": ["todo_write", "todo_read"]},
+                    ),
+                )],
+            )
+            return
         self.calls += 1
         if self.calls == 1:
             yield StreamEvent(
@@ -5641,7 +5650,7 @@ async def test_acp_host_env_context_feeds_bash_and_execute_code_runtime_env(
 async def test_acp_emits_todo_snapshot_raw_output(tmp_path):
     config = Config(
         llm=LLMConfig(api_key="test-key"),
-        agent=AgentConfig(max_steps=3, workspace_dir=str(tmp_path)),
+        agent=AgentConfig(max_steps=4, workspace_dir=str(tmp_path)),
         tools=ToolsConfig(enable_sub_agent=False),
     )
     conn = DummyConn()
@@ -5656,7 +5665,7 @@ async def test_acp_emits_todo_snapshot_raw_output(tmp_path):
     todo_snapshots = [
         update.update.rawOutput
         for update in conn.updates
-        if getattr(update.update, "rawOutput", None)
+        if isinstance(getattr(update.update, "rawOutput", None), dict)
         and update.update.rawOutput.get("type") == "todo_snapshot"
     ]
     assert any(

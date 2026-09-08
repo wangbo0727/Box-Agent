@@ -52,6 +52,7 @@ decision, read those entries together.
 | Tool name aliases | `Tool.aliases`, `build_tool_name_index`, OpenClaw, Hermes | Compatibility names are execution-only, use canonical Box-Agent argument schemas, and fail closed on conflicts. | Built-in mappings complete the generic alias mechanism in `fad2436`. | [2026-08-20 built-in aliases](#2026-08-20--built-in-tool-name-compatibility-aliases) |
 | Filesystem path resolution | `SearchFilesTool`, `path_candidates.py`, `PATH_NOT_FOUND`, ACP file-access prompt | Missing paths may return bounded structural candidates, but the model must retry a specific path and the permission engine remains final authority. | Hardens the broad-Home-search block without adding aliases or automatic authorization. | [2026-08-20 path candidates](#2026-08-20--bounded-structural-candidates-for-missing-filesystem-paths) |
 | File writes | `box_agent/tools/file_tools.py`, `write_file` | Ordered chunks commit atomically, with bounded transactions, replay protection, and whole-body safety checks. | PR #37 hardens PR #34; both remain relevant. | [PR #37](#2026-08-17--transactional-write-safety-follow-up-pr-37), [PR #34](#2026-08-17--unified-transactional-write_file-protocol-pr-34) |
+| Tool Engine and local discovery | `tools/engine/`, `ToolEnginePort`, `local_tool_exposure.py`, `tool_messages.py`, `prepare_scheduled_task` | One execution/result chain, kernel-owned final replies, stable local/MCP discovery and execution-only schedule alias. | Reorganizes the kernel tool helpers and extends PR #31; preserves original Skill and Session Log contracts. | [2026-09-09 Tool Engine](#2026-09-09--tool-engine-ownership-and-local-discovery) |
 | Tool invocation | `box_agent/tools/base.py`, `schema_validation.py`, `Tool.invoke` | Tool schemas and arguments fail closed before `execute()` is called. | Current at this baseline. | [PR #33](#2026-08-17--validate-tool-arguments-before-execution-pr-33) |
 | Image inspection | `inspect_images`, `vision_review`, canonical image blocks, structured image attachments, transient follow-up | Image inspection is instruction-driven and read-only; `proxy` returns utility-model text, while `native` uses a bounded one-request main-model overlay that never enters durable history. | PR #62 replaced `vision_review`; PR #76 is being rebased as an additive native strategy. | [PR #62](#2026-08-21--instruction-driven-image-inspection-pr-62), [PR #76](#2026-08-23--request-only-native-image-inspection-pr-76) |
 | Shell safety inspection | `shell_inspection.py`, `safety.py`, `bash_tool.py`, dangerous commands, DWS | Policy checks inspect shell structure and executable invocations while treating embedded-language bodies as data; bounded parsing fails closed for policy-relevant ambiguity. | Pending PR #63; must be reviewed as a security-boundary change. | [PR #63](#2026-08-21--structure-aware-shell-policy-inspection-pr-63) |
@@ -72,6 +73,36 @@ Release, provider API, and ACP compatibility have their own sources under
 [long-lived release and compatibility history](#long-lived-release-and-compatibility-history).
 
 ## Pending material changes
+
+### 2026-09-09 — Tool Engine ownership and local discovery
+
+- **Change:** `codex/refactor-tool-engine`, based on `d2f665f`; no merge
+  reference yet. [Design](../design/tool-refactor/design.md),
+  [implementation guide](../design/tool-refactor/runtime.md) and
+  [verification record](../design/tool-refactor/progress.md) describe this Tool
+  phase; the separate Skill Engine phase is not included.
+- **Durable behavior:** `tools/engine/` prepares request-bound definitions and
+  real targets, executes calls and streams permission continuations, and
+  finishes serial/parallel results through one path. `kernel/tool_messages.py`
+  owns pre-effect call records and final replies; Session Log remains the only
+  durable session source. Legacy kernel helpers re-export the implementation.
+- **Compatibility:** public entry points, Tool instances, session resources and
+  original Skill activation/recovery remain. Standalone invocation adds only
+  optional event/cancellation context. Local low-frequency schemas become
+  searchable alongside MCP; activation changes visibility, never authority.
+  `prepare_scheduled_task` replaces the model name `create_scheduled_task`;
+  old incoming names resolve to the same Tool and draft payload. Restoring
+  history never executes the draft again.
+- **Corrections included:** permission retry progress retains the parent call;
+  each parallel result uses its own arguments; Hook-modified paths are checked
+  again; durability failures propagate; cancellation prevents a new execution
+  attempt. Ordinary failures do not trigger a general automatic retry.
+- **Proof anchors:** call-record, permission-stream, result-commit, preparation,
+  local-discovery, schedule-migration and capability-baseline tests; original
+  core/ACP/Skill/session regressions. Exact-Head CI, real-task and packaged-host
+  status are recorded separately in the verification record.
+- **Rollback:** revert the Tool phase as one unit. There is no Session Log
+  migration, new public configuration requirement, or new Skill scheduler.
 
 ### 2026-09-08 — native CLI session tracing
 

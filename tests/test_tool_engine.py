@@ -674,3 +674,32 @@ async def test_parallel_passthrough_failure_consumes_failed_sibling() -> None:
         and context.get("exception") is sibling_failure
         for context in loop_contexts
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_scheduler_preserves_supplied_parent_without_consuming_its_queue(parallel):
+    from box_agent.tools.base import ToolInvocationContext
+
+    class ContextTool(EventEmittingTool, _TestTool):
+        name = "context_tool"
+
+        async def execute(self, **kwargs):
+            self._event_queue.put_nowait(self._parent_tool_call_id)
+            return ToolResult(success=True)
+
+    parent_queue = asyncio.Queue()
+    parent_queue.put_nowait("sibling")
+    request = ToolInvocationRequest(
+        call_id="child-call", tool_name="context_tool", arguments={},
+        invocation_context=ToolInvocationContext(
+            event_queue=parent_queue, parent_tool_call_id="parent-call",
+        ),
+    )
+    engine = _engine({"context_tool": ContextTool()})
+    records = [record async for record in (
+        engine.invoke_parallel([request]) if parallel else engine.invoke_serial(request)
+    )]
+    assert [record.event for record in records if isinstance(record, ToolEngineProgress)] == ["parent-call"]
+    assert parent_queue.qsize() == 1
+    assert parent_queue.get_nowait() == "sibling"

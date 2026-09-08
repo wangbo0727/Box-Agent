@@ -49,7 +49,7 @@ from box_agent.tools.runtime import SkillRuntimeContext, build_skill_runtime_con
 from box_agent.tools.skill_execution_env import build_skill_execution_env
 from box_agent.tools.skill_scratch import prepare_skill_scratch_dir
 from box_agent.tools.mcp_config_tool import McpConfigTool
-from box_agent.tools.schedule_tool import CreateScheduledTaskTool
+from box_agent.tools.schedule_tool import PrepareScheduledTaskTool
 from box_agent.tools.skill_tool import create_skill_tools
 from box_agent.tools.sub_agent_tool import SubAgentTool
 from box_agent.tools.todo_tool import TodoReadTool, TodoStore, TodoWriteTool
@@ -310,8 +310,8 @@ async def initialize_base_tools(
     # Pops a pre-filled "create scheduled task" window on the desktop host via
     # ToolResult.raw_output → tool_call_update.rawOutput. Does not persist anything
     # itself; the renderer owns the actual save.
-    tools.append(CreateScheduledTaskTool())
-    _out(f"{Colors.GREEN}✅ Loaded Scheduled Task tool (create_scheduled_task){Colors.RESET}")
+    tools.append(PrepareScheduledTaskTool())
+    _out(f"{Colors.GREEN}✅ Loaded Scheduled Task tool (prepare_scheduled_task){Colors.RESET}")
 
     tools.append(McpConfigTool())
     _out(f"{Colors.GREEN}✅ Loaded MCP Config tool (mcp_config){Colors.RESET}")
@@ -702,6 +702,9 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
                 ),
             ]
         )
+        for tool in tools:
+            if tool.name == "append_file":
+                tool._model_exposure_direct = use_output_dir
         _out(
             f"{Colors.GREEN}✅ Loaded file operation tools "
             f"(relative root: {relative_root}, scope: {workspace_dir}){Colors.RESET}"
@@ -734,7 +737,9 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
 
     # Host-neutral execution receipt. External workflow identity, task context,
     # versions, and submission remain the host's responsibility.
-    tools.append(ReportExecutionResultTool())
+    receipt_tool = ReportExecutionResultTool()
+    receipt_tool._model_exposure_direct = process_owner_id is not None
+    tools.append(receipt_tool)
     _out(f"{Colors.GREEN}✅ Loaded execution result reporting tool{Colors.RESET}")
 
     # Jupyter sandbox tool - Python code execution environment

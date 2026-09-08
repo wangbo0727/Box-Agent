@@ -2048,3 +2048,104 @@ def test_add_workspace_tools_wires_sub_agent_token_limit(tmp_path) -> None:
     assert sub_agent._batch_synthesis_timeout_seconds == 234.5
     assert sub_agent._resolve_skill_loader() is skill_loader
     assert sub_agent._resolve_capability_state() == "loading"
+
+
+async def test_batch_files_uses_public_permission_chain_with_parent_events(monkeypatch):
+    import box_agent.runtime as runtime
+    from box_agent.tools.base import EventEmittingTool, ToolInvocationContext
+
+    class TwoGateReadTool(EventEmittingTool, Tool):
+        name = "read_file"
+        description = "Read one fixture after two approvals"
+        parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+
+        def __init__(self):
+            super().__init__()
+            self.approved = []
+            self.calls = 0
+            self.effects = 0
+
+        def approve_permission_request(self, request):
+            self.approved.append(request)
+
+        async def execute(self, path):
+            self.calls += 1
+            if len(self.approved) < 2:
+                return ToolResult(success=False, permission_request={
+                    "scope": "filesystem", "requested_scope": f"gate-{len(self.approved)}",
+                })
+            self.effects += 1
+            self._event_queue.put_nowait({"read_parent": self._parent_tool_call_id})
+            return ToolResult(success=True, content="body", raw_output={
+                "source_char_count": 4, "selected_char_count": 4,
+                "selected_line_count": 1, "truncated": False,
+            })
+
+    real_invoke = runtime.invoke_tool_with_permissions
+    public_calls = []
+
+    async def tracked_invoke(tool, arguments, **kwargs):
+        public_calls.append((tool, arguments, kwargs))
+        return await real_invoke(tool, arguments, **kwargs)
+
+    monkeypatch.setattr(runtime, "invoke_tool_with_permissions", tracked_invoke)
+    llm = AsyncMock()
+    llm.generate.return_value = LLMResponse(content="summary", finish_reason="stop")
+    read_tool = TwoGateReadTool()
+    tool = SubAgentTool(llm=llm, parent_tools={"read_file": read_tool})
+    negotiator = AsyncMock()
+    negotiator.negotiate.return_value = True
+    tool.set_permission_negotiator(negotiator)
+    queue = asyncio.Queue()
+    result = await tool.invoke({"task": "Summarize", "files": ["one.md"]}, context=(
+        ToolInvocationContext(event_queue=queue, parent_tool_call_id="parent-batch")
+    ))
+    assert result.success
+    assert read_tool.calls == 3
+    assert len(read_tool.approved) == 2
+    assert read_tool.effects == 1
+    assert len(public_calls) == 1
+    assert public_calls[0][:2] == (read_tool, {"path": "one.md"})
+    events = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert {"read_parent": "parent-batch"} in events
+    assert llm.generate.await_count == 1
+    llm.generate_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["initial", "retry", "negotiation", "approval_hook"])
+async def test_batch_files_never_converts_durability_failure_to_prefetch_result(stage):
+    from box_agent.session_log import SessionLogDurabilityError
+
+    failure = SessionLogDurabilityError("child durable write failed")
+
+    class DurableReadTool(Tool):
+        name = "read_file"
+        description = "Read one fixture"
+        parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+        calls = 0
+
+        def approve_permission_request(self, request):
+            if stage == "approval_hook":
+                raise failure
+
+        async def execute(self, path):
+            self.calls += 1
+            if stage != "initial" and self.calls == 1:
+                return ToolResult(success=False, permission_request={
+                    "scope": "filesystem", "requested_scope": "fixture",
+                })
+            raise failure
+
+    class Negotiator:
+        async def negotiate(self, request):
+            if stage == "negotiation":
+                raise failure
+            return True
+
+    llm = AsyncMock()
+    tool = SubAgentTool(llm=llm, parent_tools={"read_file": DurableReadTool()})
+    tool.set_permission_negotiator(Negotiator())
+    with pytest.raises(SessionLogDurabilityError) as caught:
+        await tool.execute(task="Summarize", files=["one.md"])
+    assert caught.value is failure
+    llm.generate.assert_not_called()

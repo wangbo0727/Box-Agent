@@ -416,6 +416,8 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
 
     bindings = DEFAULT_CAPABILITY_SCHEMA.bindings
 
+    from box_agent.kernel.ports import ToolEnginePort
+
     ports_by_field = {
         "llm": LLMPort,
         "summary_llm": SummaryLLMPort,
@@ -428,6 +430,7 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
         "tool_catalog": ToolCatalogPort,
         "tool_exposure": ToolExposurePort,
         "tool_result_store": ToolResultStorePort,
+        "tool_engine": ToolEnginePort,
     }
     assert tuple(binding.port_type for binding in bindings) == tuple(
         ports_by_field[field.name] for field in fields(KernelServices)

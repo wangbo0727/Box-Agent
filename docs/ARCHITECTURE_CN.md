@@ -15,9 +15,12 @@ flowchart TB
     P["静态 PluginHost<br/>Descriptor / 强类型 Registry"]
     S["不可变 KernelServices<br/>Kernel-owned Ports"]
     L["AgentLoopKernel<br/>kernel.loop"]
-    E["Kernel Engines<br/>Context / Stream / Tool / Result"]
+    E["Kernel 服务<br/>上下文 / 模型流 / 工具消息提交"]
+    T["工具能力<br/>tools/engine：准备 / 执行 / 结果"]
 
     H --> A --> R --> C --> O --> P --> S --> L --> E
+    L -->|ToolEnginePort| T
+    T -->|提交回调| E
 ```
 
 生产调用路径因此固定为：**CLI/ACP → Agent → runtime → core 兼容门面 →
@@ -35,7 +38,7 @@ PluginHost、composition、ACP、CLI、officev3 或其他产品适配器。Plugi
 | 能力层 | `box_agent/tools/`（除 `base.py`）、`box_agent/skills/`、`box_agent/llm/` 中的 Provider、`memory.py` | Tool、自包含 Skill、Provider、存储与领域校验器 |
 | 稳定公共 API | `agent.py`、`runtime.py`、`core.py`、`events.py`、`schema.py` | 向后兼容的调用方式与事件/schema 契约 |
 | 外层装配 | `composition.py`、`plugins/` | 显式 Descriptor、校验、依赖解析、分 Scope 激活、不可变服务装配与释放 |
-| 稳定 Kernel | `kernel/`、`session_log.py`、`loop_guards.py`、`hooks.py`、`artifacts.py`、`tools/base.py` | 循环不变量、调度、取消、通用预算、持久化、Ports 与安全 seam |
+| 稳定 Kernel | `kernel/`、`session_log.py`、`loop_guards.py`、`hooks.py`、`artifacts.py`、`tools/base.py` | 对话不变量、调用闭合、持久化、Ports 与安全契约；具体工具调度和预算归 tools/engine |
 
 “核心团队维护”表示修改需要核心维护者评审，不表示这些文件永远不能变化。
 
@@ -64,7 +67,8 @@ async for event in agent.run_events(options=options):
 
 `Agent.run_events()`、`Agent.run()`、`box_agent.runtime.run_agent_loop()`、
 `box_agent.runtime.invoke_tool_with_permissions()` 和
-`box_agent.core.run_agent_loop()` 的签名与默认值保持不变。调用方不会新增
+`box_agent.core.run_agent_loop()` 的原调用形式与默认值保持兼容。独立调用
+`invoke_tool_with_permissions` 新增可选 `invocation_context` / `is_cancelled`，原 tuple 返回不变。调用方不会新增
 PluginHost、Registry 或 `KernelServices` 参数。ACP 仍消费
 `Agent.run_events(options=...)` 并把事件渲染成协议更新；CLI 仍调用
 `Agent.run()`，终端渲染由其中的 `Agent._render_event()` 负责。Kernel 与
@@ -79,10 +83,10 @@ composition 只产生事件，均不负责渲染。
 | `kernel/loop.py` | Step 编排、StopReason 映射、事件顺序及其他 Kernel 模块的调用 |
 | `kernel/context_engine.py` | 上下文估算、压缩、摘要回退、最近消息选择与运行状态恢复 |
 | `kernel/stream_controller.py` | Provider 流存活性、活动事件、stale 检测与流恢复 |
-| `kernel/permission_gateway.py` | 权限 payload 规范化、有限次数审批重试，以及循环外共享工具权限行为 |
-| `kernel/tool_engine.py` | 串并行工具调度、并发限制、活动信号、取消、超时与结果闭合 |
-| `kernel/tool_result_pipeline.py` | 串并行统一结果路径：模型历史、Session Log/Trace、资源回执、事件、Web 结果与产物 |
-| `kernel/state.py` | 无 I/O 的单次运行工具预算与执行状态 |
+| `tools/engine/execution.py` | 共同的校验调用与流式权限继续；旧 permission 模块兼容导出 |
+| `tools/engine/engine.py`、`scheduler.py`、`budget.py` | 每 run 调用编排、本次请求目标、原调度/取消与预算 |
+| `tools/engine/results.py`、`tools/*_result_adapter.py` | 串并行统一结果完成；浏览器、文件、Skill、搜索和产物的能力适配 |
+| `kernel/tool_messages.py` | 副作用前记录最终参数、提交最终回复与修复中断调用 |
 | `kernel/ports.py` | Kernel-owned 最小 Protocol 与不可变 `KernelServices` 容器 |
 
 主要调用关系为：
@@ -94,7 +98,7 @@ AgentLoopKernel
   -> 响应包含 ToolCall 时调用 Tool Engine
        -> 工具请求授权时调用 Permission Gateway
        -> 每个串行或并行完成项都进入 Tool Result Pipeline
-  -> 使用 kernel state 保存运行级计数与执行记录
+  -> 通过 kernel tool_messages 回调提交调用和最终回复
   -> 只从 KernelServices 获取已解析能力
 ```
 
@@ -105,9 +109,9 @@ AgentLoopKernel
 | Agent 循环与停止/事件不变量 | `kernel/loop.py` |
 | 上下文大小、摘要、压缩与恢复 helper | `kernel/context_engine.py` |
 | Provider stale 与活动流 helper | `kernel/stream_controller.py` |
-| 权限协商 helper | `kernel/permission_gateway.py` |
-| 工具调度、并行、取消与预算 | `kernel/tool_engine.py` + `kernel/state.py` |
-| 工具结果历史、Trace、资源、Web 规范化与产物 helper | `kernel/tool_result_pipeline.py` |
+| 权限协商 helper | `tools/engine/execution.py`，旧 kernel 入口兼容导出 |
+| 工具调度、并行、取消与预算 | `tools/engine/`，旧 kernel 入口兼容导出 |
+| 工具结果及专项适配 | `tools/engine/results.py` 和 tools adapters；最终历史提交由 `kernel/tool_messages.py` 负责 |
 | 旧 helper 导入路径与计时默认值 monkeypatch 行为 | `core.py` 重导出 / wrapper |
 
 ## 静态 Plugin、Registry 与能力替换

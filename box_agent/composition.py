@@ -72,7 +72,18 @@ def compose_default_kernel_services(
 ) -> KernelServices:
     """Resolve one immutable bundle from the existing call arguments."""
 
-    return compose_default_services(**_default_capabilities(run_arguments))
+    from dataclasses import replace
+    from .tools.engine.engine import DefaultToolEngine
+
+    services = compose_default_services(**_default_capabilities(run_arguments))
+    return replace(
+        services,
+        tool_engine=DefaultToolEngine(
+            tools=services.tool_catalog,
+            tool_exposure=services.tool_exposure,
+            tool_result_store=services.tool_result_store,
+        ),
+    )
 
 
 def _add_cleanup_note(error: BaseException, note: str) -> None:

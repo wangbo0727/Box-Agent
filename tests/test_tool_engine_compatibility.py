@@ -1,7 +1,7 @@
 """C1 characterization of the pre-Engine setup and Agent tool contract.
 
-These expectations describe the current assembly, including unconditional host
-tools and session goal tools. They are not the proposed C5 exposure policy.
+The fixed C1 fixture remains intact. Only the enumerated C5 name/description
+changes and direct/discoverable sets are applied before exact comparisons.
 Network/runtime discovery is isolated; setup, tools, stores and Agent are real.
 """
 
@@ -49,6 +49,20 @@ _FLAGS_OFF = {
     "enable_mcp": False,
 }
 _SCHEMA_FIXTURE = Path(__file__).parent / "fixtures/tool_engine/c1_schemas.json"
+_C5_SCHEMA_CHANGES = json.loads(
+    (Path(__file__).parent / "fixtures/tool_engine/c5_schema_changes.json").read_text()
+)
+_C5_DISCOVERABLE = {
+    "append_file", "query_jsonl", "bash_output", "bash_kill", "sandbox_status",
+    "mcp_config", "report_execution_result", "prepare_scheduled_task",
+    "plan_read", "plan_write", "todo_read", "todo_write", "goal_read", "goal_write",
+    "memory_read", "memory_search", "memory_write", "obsidian_create_note",
+    "obsidian_update_note", "obsidian_daily_note", "search_skillhub", "install_skillhub_skill",
+}
+
+
+def _c5_names(names):
+    return {_C5_SCHEMA_CHANGES["renames"].get(name, name) for name in names}
 
 
 @pytest.fixture
@@ -193,7 +207,16 @@ def _assert_schema_contract(tools, profile, *, child_read_tools=()):
     index = build_tool_name_index(tools)
     expected_call_names = set()
     for tool in tools:
-        entry = expected[tool.name]
+        baseline_name = next(
+            (old for old, new in _C5_SCHEMA_CHANGES["renames"].items() if new == tool.name),
+            tool.name,
+        )
+        entry = expected[baseline_name]
+        entry["schema"]["name"] = tool.name
+        if tool.name in _C5_SCHEMA_CHANGES["aliases"]:
+            entry["aliases"] = _C5_SCHEMA_CHANGES["aliases"][tool.name]
+        if tool.name in _C5_SCHEMA_CHANGES["descriptions"]:
+            entry["schema"]["description"] = _C5_SCHEMA_CHANGES["descriptions"][tool.name]
         if tool.name == "sub_agent":
             # This default is the one capability-dependent schema field. The
             # caller supplies the independently expected read set, never a set
@@ -262,14 +285,20 @@ async def test_setup_capability_matrix_preserves_exact_tools_and_schemas(
     isolated_setup, options, added,
 ):
     assembly = await _assemble(isolated_setup, **options)
-    expected = _ALWAYS_BASE | _ALWAYS_WORKSPACE | added
+    expected = _c5_names(_ALWAYS_BASE | _ALWAYS_WORKSPACE | added)
     assert {tool.name for tool in assembly.tools} == expected
     assert (assembly.mcp_task is not None) == ("fixture_lookup" in added)
     assert len(isolated_setup.load_calls) == int("fixture_lookup" in added)
     assert (assembly.loader is not None) == ("get_skill" in added)
     assert (assembly.skill_task is not None) == options.get("defer_skills", False)
     agent = _agent(assembly)
-    assert set(agent.tools) == expected | _GOALS
+    assert set(agent.tools) == expected | _GOALS | {"tool_search"}
+    expected_direct = (expected - _C5_DISCOVERABLE) | {"tool_search"}
+    if "read_file" in expected:
+        expected_direct.add("query_jsonl")
+    if options.get("process_owner_id") is not None:
+        expected_direct.add("report_execution_result")
+    assert agent.mcp_tool_exposure.prepare_tools(list(agent.tools.values())).offered_names == expected_direct
     # Agent must retain each actual setup object, including last-wins helpers.
     assembled_by_name = {tool.name: tool for tool in assembly.tools}
     assert all(agent.tools[name] is tool for name, tool in assembled_by_name.items())
@@ -290,10 +319,11 @@ async def test_utility_agent_keeps_goal_tools_and_session_local_state(isolated_s
         )
         for index in range(2)
     ]
-    expected = _GOALS | ({"tool_search"} if deferred else set())
+    expected = _GOALS | {"tool_search"}
     for agent in agents:
         assert set(agent.tools) == expected
         assert agent.goal is None
+        assert agent.mcp_tool_exposure.prepare_tools(list(agent.tools.values())).offered_names == {"tool_search"}
         assert agent.tools["goal_read"]._agent is agent
         assert agent.tools["goal_write"]._agent is agent
         _assert_schema_contract(list(agent.tools.values()), isolated_setup.profile)
@@ -303,6 +333,8 @@ async def test_utility_agent_keeps_goal_tools_and_session_local_state(isolated_s
     assert result.success
     assert agents[0].goal.objective == "Fixture goal"
     assert agents[1].goal is None
+    assert agents[0].mcp_tool_exposure.prepare_tools(list(agents[0].tools.values())).offered_names == expected
+    assert agents[1].mcp_tool_exposure.prepare_tools(list(agents[1].tools.values())).offered_names == {"tool_search"}
 
 
 @pytest.mark.asyncio
@@ -389,7 +421,9 @@ async def test_workspace_root_is_shared_by_file_shell_and_image_tools(isolated_s
         isolated_setup, flags={"enable_file_tools": True, "enable_bash": True},
         llm_mode="vision", image_endpoint=True, use_output_dir=use_output_dir,
     )
-    tools = _agent(assembly).tools
+    agent = _agent(assembly)
+    tools = agent.tools
+    assert ("append_file" in agent.mcp_tool_exposure.prepare_tools(list(tools.values())).offered_names) is use_output_dir
     expected_root = assembly.workspace / "output" if use_output_dir else assembly.workspace
     assert Path(tools["bash"].workspace_dir) == expected_root
     assert Path(tools["bash"].scope_root_dir) == assembly.workspace
@@ -404,5 +438,5 @@ async def test_image_endpoint_environment_enables_registered_tool(isolated_setup
     monkeypatch.setenv("BOX_AGENT_IMAGE_GENERATION_ENDPOINT", "https://image.invalid/env")
     assembly = await _assemble(isolated_setup)
     tools = _agent(assembly).tools
-    assert set(tools) == _ALWAYS_BASE | _ALWAYS_WORKSPACE | _GOALS | {"generate_image"}
+    assert set(tools) == _c5_names(_ALWAYS_BASE | _ALWAYS_WORKSPACE | _GOALS) | {"generate_image", "tool_search"}
     assert tools["generate_image"].endpoint == "https://image.invalid/env"

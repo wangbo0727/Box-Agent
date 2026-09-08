@@ -16,9 +16,12 @@ flowchart TB
     P["Static PluginHost<br/>descriptors / typed registries"]
     S["Immutable KernelServices<br/>kernel-owned Ports"]
     L["AgentLoopKernel<br/>kernel.loop"]
-    E["Kernel engines<br/>context / stream / tools / results"]
+    E["Kernel services<br/>context / stream / tool messages"]
+    T["Tool capability<br/>tools/engine: prepare / execute / results"]
 
     H --> A --> R --> C --> O --> P --> S --> L --> E
+    L -->|ToolEnginePort| T
+    T -->|commit callback| E
 ```
 
 The production call path is therefore **CLI/ACP → Agent → runtime → core
@@ -37,7 +40,7 @@ Application and capability modules must not import `box_agent.core` directly.
 | Capability | `box_agent/tools/` except `base.py`, `box_agent/skills/`, provider implementations in `box_agent/llm/`, `memory.py` | Tools, self-contained Skills, providers, storage, and domain validators |
 | Stable public API | `agent.py`, `runtime.py`, `core.py`, `events.py`, `schema.py` | Backward-compatible calls and event/schema contracts |
 | Outer composition | `composition.py`, `plugins/` | Explicit descriptors, validation, dependency resolution, scoped activation, immutable service assembly, and disposal |
-| Stable kernel | `kernel/`, `session_log.py`, `loop_guards.py`, `hooks.py`, `artifacts.py`, `tools/base.py` | Loop invariants, scheduling, cancellation, generic budgets, persistence, Ports, and security seams |
+| Stable kernel | `kernel/`, `session_log.py`, `loop_guards.py`, `hooks.py`, `artifacts.py`, `tools/base.py` | Conversation invariants, tool-call closure, persistence, Ports and security contracts; concrete tool scheduling and budgets live in tools/engine |
 
 “Core-owned” means a core maintainer reviews and approves the change. It does
 not mean these files can never change.
@@ -66,10 +69,9 @@ such as `SubAgentTool`, may import `run_agent_loop` from
 `box_agent.runtime`. Production code outside that bridge must not import
 `box_agent.core`.
 
-The signatures and defaults of `Agent.run_events()`, `Agent.run()`,
-`box_agent.runtime.run_agent_loop()`,
-`box_agent.runtime.invoke_tool_with_permissions()`, and
-`box_agent.core.run_agent_loop()` remain unchanged. In particular, callers do
+Existing call forms and defaults remain compatible.
+`runtime.invoke_tool_with_permissions()` additionally accepts optional
+`invocation_context` and `is_cancelled`; its tuple return is unchanged. In particular, callers do
 not pass a PluginHost, Registry, or `KernelServices`. ACP still consumes
 `Agent.run_events(options=...)` and renders those events into protocol updates.
 CLI still calls `Agent.run()`, whose `Agent._render_event()` owns terminal
@@ -85,10 +87,10 @@ modules have deliberately narrow responsibilities:
 | `kernel/loop.py` | Step orchestration, stop-reason mapping, event ordering, and calls into the other kernel modules |
 | `kernel/context_engine.py` | Context estimation, compaction, summarization fallback, recent-message selection, and runtime-state recovery |
 | `kernel/stream_controller.py` | Provider stream liveness, activity events, stale detection, and stream recovery |
-| `kernel/permission_gateway.py` | Permission payload normalization, bounded approval retries, and shared out-of-loop tool permission behavior |
-| `kernel/tool_engine.py` | Serial/parallel tool scheduling, concurrency limits, activity, cancellation, timeouts, and result closure |
-| `kernel/tool_result_pipeline.py` | The one serial/parallel result path: model history, Session Log/trace, resource receipts, events, web results, and artifacts |
-| `kernel/state.py` | Per-run tool budgets and tool-execution state without I/O |
+| `tools/engine/execution.py` | Single validated invocation and streaming permission continuation; legacy permission module re-exports it |
+| `tools/engine/engine.py`, `scheduler.py`, `budget.py` | Run-scoped call orchestration, request-bound targets, original scheduling/cancellation and budgets |
+| `tools/engine/results.py`, `tools/*_result_adapter.py` | One result path and capability-owned browser/file/Skill/search/artifact adaptation |
+| `kernel/tool_messages.py` | Durable pre-effect call record, final reply commit and interrupted-call repair |
 | `kernel/ports.py` | Minimal kernel-owned Protocols and the immutable `KernelServices` bundle |
 
 The main relationship is:
@@ -100,7 +102,7 @@ AgentLoopKernel
   -> Tool Engine when the response contains tool calls
        -> Permission Gateway when a tool requests approval
        -> Tool Result Pipeline for every serial or parallel completion
-  -> kernel state for run-scoped counters and execution records
+  -> kernel tool_messages through call/result commit callbacks
   -> KernelServices for already resolved capabilities
 ```
 
@@ -112,9 +114,9 @@ as follows:
 | Agent loop and stop/event invariants | `kernel/loop.py` |
 | Context sizing, summary, compaction, and recovery helpers | `kernel/context_engine.py` |
 | Provider-stale and activity stream helpers | `kernel/stream_controller.py` |
-| Permission negotiation helpers | `kernel/permission_gateway.py` |
-| Tool scheduling, parallelism, cancellation, and budgets | `kernel/tool_engine.py` + `kernel/state.py` |
-| Tool-result history, trace, resources, web normalization, and artifact helpers | `kernel/tool_result_pipeline.py` |
+| Permission negotiation helpers | `tools/engine/execution.py` (legacy kernel re-export) |
+| Tool scheduling, parallelism, cancellation, and budgets | `tools/engine/` (legacy kernel re-exports) |
+| Tool-result preparation and capability adaptations | `tools/engine/results.py` and tools adapters; final history commit in `kernel/tool_messages.py` |
 | Legacy helper imports and timing-default monkeypatch behavior | `core.py` re-exports/wrappers |
 
 ## Static plugins, registries, and replacement
