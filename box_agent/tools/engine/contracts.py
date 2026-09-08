@@ -43,6 +43,7 @@ class ToolDefinitionView:
 
     name: str
     description: str
+    aliases: tuple[str, ...]
     server_name: str | None
     _server_name: str | None
     _parameters: dict[str, Any] = field(repr=False)
@@ -56,6 +57,7 @@ class ToolDefinitionView:
         return cls(
             name=tool.name,
             description=tool.description,
+            aliases=tuple(tool.aliases),
             server_name=getattr(tool, "server_name", ""),
             _server_name=getattr(tool, "_server_name", ""),
             _parameters=deepcopy(tool.parameters),
