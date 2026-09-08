@@ -1,0 +1,1516 @@
+{
+  "baseline": "d2f665f",
+  "normalization": "One schema per canonical name; only the temporary profile prefix becomes <PROFILE>. POSIX shell discovery is controlled. No external service was contacted.",
+  "tools": {
+    "append_file": {
+      "aliases": [],
+      "schema": {
+        "name": "append_file",
+        "description": "Append content to a file, creating it if it does not exist. Keep each content chunk under 12,000 characters; use multiple append calls when needed. To atomically replace a complete large artifact, use ordered write_file chunks.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or relative path to the file"
+            },
+            "content": {
+              "type": "string",
+              "maxLength": 12000,
+              "description": "Content chunk to append. Keep this under 12,000 characters. Use multiple append calls when needed, or ordered write_file chunks to atomically replace a complete artifact."
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    "bash": {
+      "aliases": [
+        "exec",
+        "terminal"
+      ],
+      "schema": {
+        "name": "bash",
+        "description": "Execute bash commands in foreground or background.\n\nDo NOT use cat/head/tail to read files; use read_file instead.\nDo NOT use grep/rg/find/ls to search or list files; use search_files instead.\nReserve bash for git, builds, tests, package managers, processes, scripts, and system commands.\n\nParameters:\n  - command (required): Bash command to execute\n  - timeout (optional): Timeout in seconds (default: 300, max: 1200) for foreground commands\n  - run_in_background (optional): Set true for commands that must continue after the tool call\n  - lifetime (optional): `turn` (default) is reclaimed when the current turn ends; `runtime` survives the turn and is reclaimed when explicitly killed or when Box-Agent exits\n\nTips:\n  - Quote file paths with spaces: cd \"My Documents\"\n  - Chain dependent commands with &&: git add . && git commit -m \"msg\"\n  - Use absolute paths instead of cd when possible\n  - Put disposable intermediate files under \"$BOX_AGENT_SCRATCH_DIR\"; the session cleans this reserved directory safely, so do not remove it with rm\n  - Run the injected Python runtime as \"$BOX_AGENT_PYTHON\"; do not write \"$BOX_AGENT_PYTHON:-python3\"\n  - For one-off data scripts, validate input types and never append to a collection while iterating it; collect additions separately or iterate over a copy\n  - A timeout, resource stop, or optional QA failure is advisory for artifact workflows: preserve usable output, record the warning, and continue to delivery when safe\n  - For background commands, monitor with bash_output and terminate with bash_kill\n  - Use lifetime=runtime only when the user explicitly needs a service or command to remain available after the final response\n\nExamples:\n  - git status\n  - npm test\n  - \"$BOX_AGENT_PYTHON\" -u -m http.server 0 --bind 127.0.0.1 (with run_in_background=true; read the dynamic port with bash_output)",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "maxLength": 8000,
+              "description": "The bash command to execute. Quote file paths with spaces using double quotes."
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "Optional: Timeout in seconds (default: 300, max: 1200). Only applies to foreground commands.",
+              "minimum": 1,
+              "maximum": 1200,
+              "default": 300
+            },
+            "run_in_background": {
+              "type": "boolean",
+              "description": "Optional: Set to true to run the command in the background. Use this for long-running commands like servers. You can monitor output using bash_output tool.",
+              "default": false
+            },
+            "lifetime": {
+              "type": "string",
+              "enum": [
+                "turn",
+                "runtime"
+              ],
+              "description": "Optional background-process lifetime. 'turn' (default) is automatically reclaimed when the current turn ends. Use 'runtime' only when the user explicitly asks for a service or command to remain available after the final response; it remains manageable with bash_output/bash_kill until Box-Agent exits.",
+              "default": "turn"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "bash_kill": {
+      "aliases": [],
+      "schema": {
+        "name": "bash_kill",
+        "description": "Kills a running background bash shell by its ID.\n\n        - Takes a bash_id parameter identifying the shell to kill\n        - Attempts graceful termination (SIGTERM) first, then forces (SIGKILL) if needed\n        - Returns the final status and any remaining output before termination\n        - Cleans up all resources associated with the shell\n        - Use this tool when you need to terminate a long-running shell\n        - Shell IDs can be found using the bash tool with run_in_background=true\n        - Both `turn` and `runtime` shells remain explicitly stoppable by their owning session\n\n        Example: bash_kill(bash_id=\"abc12345\")",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "bash_id": {
+              "type": "string",
+              "description": "The ID of the background shell to terminate. Shell IDs are returned when starting a command with run_in_background=true."
+            }
+          },
+          "required": [
+            "bash_id"
+          ]
+        }
+      }
+    },
+    "bash_output": {
+      "aliases": [],
+      "schema": {
+        "name": "bash_output",
+        "description": "Retrieves output from a running or completed background bash shell.\n\n        - Takes a bash_id parameter identifying the shell\n        - Always returns only new output since the last check\n        - Returns stdout and stderr output along with shell status\n        - Supports optional regex filtering to show only lines matching a pattern\n        - Use this tool when you need to monitor or check the output of a long-running shell\n        - Shell IDs can be found using the bash tool with run_in_background=true\n        - A `turn` shell is reclaimed when its turn ends; a `runtime` shell remains available until bash_kill or Box-Agent exit\n\n        Process status values:\n          - \"running\": Still executing\n          - \"completed\": Finished successfully\n          - \"failed\": Finished with error\n          - \"terminated\": Was terminated\n          - \"error\": Error occurred\n\n        Example: bash_output(bash_id=\"abc12345\")",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "bash_id": {
+              "type": "string",
+              "description": "The ID of the background shell to retrieve output from. Shell IDs are returned when starting a command with run_in_background=true."
+            },
+            "filter_str": {
+              "type": "string",
+              "description": "Optional regular expression to filter the output lines. Only lines matching this regex will be included in the result. Any lines that do not match will no longer be available to read."
+            }
+          },
+          "required": [
+            "bash_id"
+          ]
+        }
+      }
+    },
+    "create_scheduled_task": {
+      "aliases": [],
+      "schema": {
+        "name": "create_scheduled_task",
+        "description": "在桌面客户端弹出一个【预填好的定时任务创建窗口】，由用户最终核对并点击保存来真正创建任务。\n\n硬性前置条件：调用本工具前，你必须已经在对话中与用户确认过三要素——\n  ① 做什么（任务内容）② 多久一次（频率）③ 具体时间（几点 / 周几）。\n三要素未确认齐全时，先在对话里追问，不要调用本工具。\n\n重要：这是一次性的弹窗动作，本工具无法得知用户最终是否保存。调用成功后只能告诉用户'创建窗口已弹出，请核对后点击保存'，绝不要宣称'已创建成功'。\n\n参数说明：\n- name：简短的任务名（展示用）。\n- prompt：每次定时触发时下发给 agent 的【完整可独立执行指令】，要把内容、产出格式、数据来源都写清楚，使其脱离当前对话也能照做。\n- cron_expr：标准 5 段 cron（分 时 日 月 周）。例：每天 9 点=`0 9 * * *`；每周一 10 点=`0 10 * * 1`；每个工作日 16 点=`0 16 * * 1-5`。\n- trigger_type：'cron'（周期，默认）或 'once'（一次性）。\n- fire_at：trigger_type 为 'once' 时必填，ISO 8601 时间（如 `2026-06-20T09:00:00`）。",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "简短的任务名，用于展示。"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "每次定时触发时下发给 agent 的完整、可独立执行的指令。"
+            },
+            "cron_expr": {
+              "type": "string",
+              "description": "标准 5 段 cron（分 时 日 月 周）。trigger_type 为 'cron' 时使用；留空则默认 0 9 * * *（每天 9 点）。"
+            },
+            "trigger_type": {
+              "type": "string",
+              "enum": [
+                "cron",
+                "once"
+              ],
+              "description": "触发方式：'cron'（周期，默认）或 'once'（一次性）。"
+            },
+            "fire_at": {
+              "type": "string",
+              "description": "一次性触发时间（ISO 8601），trigger_type 为 'once' 时必填。"
+            }
+          },
+          "required": [
+            "name",
+            "prompt"
+          ]
+        }
+      }
+    },
+    "edit_file": {
+      "aliases": [
+        "edit"
+      ],
+      "schema": {
+        "name": "edit_file",
+        "description": "Perform exact string replacement in a file. The old_str must match exactly and appear uniquely in the file, otherwise the operation will fail. You must read the file first before editing. Preserve exact indentation from the source.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or relative path to the file"
+            },
+            "old_str": {
+              "type": "string",
+              "maxLength": 12000,
+              "description": "Exact string to find and replace (must be unique in file)"
+            },
+            "new_str": {
+              "type": "string",
+              "maxLength": 12000,
+              "description": "Replacement string (use for refactoring, renaming, etc.)"
+            }
+          },
+          "required": [
+            "path",
+            "old_str",
+            "new_str"
+          ]
+        }
+      }
+    },
+    "execute_code": {
+      "aliases": [],
+      "schema": {
+        "name": "execute_code",
+        "description": "Execute Python code in a persistent Jupyter kernel sandbox.\n\nThis tool runs Python code in a **real Jupyter kernel** with its own isolated environment:\n- Variables, functions, classes, imports all persist between calls\n- Reads may use allowed input paths, but durable writes are confined to the active\n  project/artifact root; runtime-managed temporary/internal roots remain available\n- Pre-installed packages: pandas, numpy, matplotlib, seaborn, scikit-learn, requests,\n  openpyxl, xlrd, python-docx, pypdf, pdfplumber, reportlab, python-pptx,\n  beautifulsoup4, lxml, pillow, pyyaml, python-dateutil, chardet\n- Do NOT %pip install any pre-installed package — it just wastes time and can hit the timeout\n- Only %pip install when you hit an actual ModuleNotFoundError for a non-listed package\n- Ideal for data analysis: load once, analyze many times\n\nExample workflow:\n  1. execute_code(code=\"import pandas as pd\\ndf = pd.read_csv('data.csv')\")\n  2. execute_code(code=\"print(df.describe())\")\n  3. execute_code(code=\"from bs4 import BeautifulSoup  # already installed\")\n  4. execute_code(code=\"%pip install some_uncommon_pkg\")  # only if truly missing\n\n**Full Python state persists in the same session!**\n\nBest practices:\n- Break complex analysis into steps\n- Keep each code argument under 8,000 characters\n- Do not inline large generated static artifact bodies (HTML/CSS/JS, shared\n  styles, JSON manifests, templates, base64, or file bodies) in execute_code.\n  Use ordered write_file chunks with chunk_index/final unless Python processing\n  is actually required.\n- Use print() to see intermediate results\n- Never use the bash tool's `pip install` for sandbox packages — bash runs against the\n  host Python and the sandbox kernel will not see those packages\n\nOutput formats:\n- Text output (print statements, repr)\n- Images (matplotlib plots)\n- Errors (simplified tracebacks)\n",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "maxLength": 8000,
+              "description": "Python code to execute. Keep this under 8,000 characters. For large generated static content such as HTML/CSS/JS, shared styles, JSON manifests, templates, base64, or file bodies, do not inline the body in execute_code; use ordered write_file chunks using chunk_index/final unless Python processing is actually required. Reads may use allowed input paths, but durable writes are confined to the active project/artifact root. Variables and functions from previous calls in the same session are available. Use %pip install <pkg> to install packages."
+            },
+            "session_id": {
+              "type": "string",
+              "description": "Session ID for persistent kernel. Same session_id shares all state. Auto-generated if not provided."
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "Execution timeout in seconds (default: 60, max: 300)",
+              "default": 60
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      }
+    },
+    "fixture_lookup": {
+      "aliases": [],
+      "schema": {
+        "name": "fixture_lookup",
+        "description": "Look up a fixture record.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "record_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "record_id"
+          ]
+        }
+      }
+    },
+    "generate_image": {
+      "aliases": [
+        "image_generate"
+      ],
+      "schema": {
+        "name": "generate_image",
+        "description": "Standard Box-Agent image tool shared by CLI and ACP. Generate or edit a bitmap image with the Box-Agent-configured image service, save it inside the active project/artifact root, and return a local path for use in HTML/PPTX assets. For explicit native image, illustration, poster, cover, or bitmap infographic requests, prefer this tool over HTML/CSS, SVG, PIL, or screenshot generation unless the user asks for one of those editable/rendered formats. Use text-to-image when the user asks for a new image. Use image-to-image with reference_images when the user asks to modify, redraw, restyle, or preserve a supplied image/logo/sketch. Use for PPT image_plan items marked `generate`. If the user forbids fallback and this tool fails, report the request as blocked. If the service is not configured, report the blocked image generation instead of pretending an asset exists. Configuration: image_generation.endpoint in config.yaml; optional image_generation.api_key for a dedicated bearer token. Environment overrides are also supported.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "Detailed image prompt. Do not ask the service to render text inside the image unless explicitly required."
+            },
+            "output_path": {
+              "type": "string",
+              "description": "Project/artifact-root-relative image path, for example assets/generated/slide-03-hero.png. In output mode the tool already targets the current output root; do not prefix the path with output/."
+            },
+            "size": {
+              "type": "string",
+              "description": "Pixel size to request, e.g. 2048x2048.",
+              "default": "2048x2048"
+            },
+            "width": {
+              "type": "integer",
+              "description": "Legacy requested width. Seedream/Doubao will map this to a supported size."
+            },
+            "height": {
+              "type": "integer",
+              "description": "Legacy requested height. Seedream/Doubao will map this to a supported size."
+            },
+            "style": {
+              "type": "string",
+              "description": "Optional visual style hint."
+            },
+            "alt_text": {
+              "type": "string",
+              "description": "Optional accessibility text for the generated asset."
+            },
+            "negative_prompt": {
+              "type": "string",
+              "description": "Optional things to avoid."
+            },
+            "image_mode": {
+              "type": "string",
+              "enum": [
+                "text_to_image",
+                "image_to_image"
+              ],
+              "description": "Use image_to_image when editing or restyling supplied reference images. Defaults to image_to_image if reference_images is non-empty."
+            },
+            "reference_images": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Workspace-relative image paths to preserve or edit. Required for image_to_image tasks such as 'change this logo', 'use this sketch', or 'based on this image'."
+            },
+            "metadata": {
+              "type": "object",
+              "description": "Optional metadata such as slide, purpose, placement, kind, or aspect ratio.",
+              "additionalProperties": true
+            },
+            "watermark": {
+              "type": "boolean",
+              "description": "Internal flag for the 'AI 生成' watermark, ON by default. DO NOT set this. Omit it for every normal image so the watermark stays on. Only pass false when the PPTX skill instructs it, or the user EXPLICITLY says to remove/disable the watermark. A plain, solid-color, test, or 'no text' image is NOT a reason to disable it."
+            },
+            "publish_artifact": {
+              "type": "boolean",
+              "description": "Publish the image as a standalone user deliverable (default true). Set false for intermediate assets embedded in a larger deliverable, as instructed by the PPTX skill. The saved file remains available."
+            },
+            "watermark_text": {
+              "type": "string",
+              "description": "Custom watermark text overriding the default 'AI 生成'. Only set when the user explicitly asks for specific watermark wording (e.g. a brand name)."
+            }
+          },
+          "required": [
+            "prompt",
+            "output_path"
+          ]
+        }
+      }
+    },
+    "get_skill": {
+      "aliases": [
+        "skill_view"
+      ],
+      "schema": {
+        "name": "get_skill",
+        "description": "Get complete content and guidance for a specified skill, used for executing specific types of tasks",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "Name of the skill to retrieve (use list_skills to view available skills)"
+            }
+          },
+          "required": [
+            "skill_name"
+          ]
+        }
+      }
+    },
+    "goal_read": {
+      "aliases": [],
+      "schema": {
+        "name": "goal_read",
+        "description": "Read the current durable session goal. Use this to check whether a goal is active, paused, complete, or unset before deciding whether to continue.",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    "goal_write": {
+      "aliases": [],
+      "schema": {
+        "name": "goal_write",
+        "description": "Update the durable session goal. Call action='complete' yourself when the active goal has been satisfied, and include evidence entries that name the files, tests, logs, command output, or artifacts proving completion; do not ask the user to run a slash command for completion. Use set/pause/resume/clear only when the user explicitly requests that lifecycle change. Use action='progress' to record verified progress, and action='block' with blocked_reason when external input is required.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "set",
+                "pause",
+                "resume",
+                "complete",
+                "clear",
+                "progress",
+                "block"
+              ],
+              "description": "Goal lifecycle operation."
+            },
+            "objective": {
+              "type": "string",
+              "description": "Goal objective. Required for action='set'."
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Evidence for completion or progress, such as tests run, files changed, logs, or artifacts."
+            },
+            "progress": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Verified progress updates to append to the goal snapshot."
+            },
+            "blocked_reason": {
+              "type": "string",
+              "description": "Reason the goal is blocked. Required for action='block'."
+            },
+            "completed_by": {
+              "type": "string",
+              "description": "Who or what completed the goal, for example 'model' or 'cli'."
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    "inspect_images": {
+      "aliases": [],
+      "schema": {
+        "name": "inspect_images",
+        "description": "Inspect 1-6 local PNG/JPEG images with the configured vision-capable model and answer the supplied instruction using relevant visual evidence. Reads image files and performs an LLM request; never modifies files.",
+        "input_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image_paths": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 6,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "description": "Local PNG/JPEG paths. Relative paths resolve from the active project/artifact root."
+            },
+            "instruction": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8000,
+              "description": "Question or task to answer from the supplied images."
+            },
+            "strategy": {
+              "type": "string",
+              "enum": [
+                "proxy",
+                "native"
+              ],
+              "default": "proxy",
+              "description": "proxy asks the configured vision utility model and returns text; native attaches canonical image blocks transiently to the active main model's next request."
+            }
+          },
+          "required": [
+            "image_paths",
+            "instruction"
+          ]
+        }
+      }
+    },
+    "mcp_config": {
+      "aliases": [],
+      "schema": {
+        "name": "mcp_config",
+        "description": "Read or modify the MCP server configuration (mcp.json). Actions: list — show current servers; inspect_browser — safely report the configured Playwright browser mode without exposing unrelated MCP credentials; update — patch an existing server while preserving unspecified settings; add — add or replace a server entry; remove — delete a server entry; enable / disable — toggle a server without deleting it. The list action reports configuration entries, not connected tools or callable schemas; use tool_search for capability discovery. This tool only confirms the configuration write, not a live connection. The host watches mcp.json and applies hot reload automatically; when registration finishes during an active turn, the runtime supplies an internal connection-state update (or load after box-agent restart).",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "inspect_browser",
+                "update",
+                "add",
+                "remove",
+                "enable",
+                "disable"
+              ],
+              "description": "Operation to perform."
+            },
+            "name": {
+              "type": "string",
+              "description": "Server name key in mcpServers (required for add/remove/enable/disable)."
+            },
+            "config": {
+              "type": "object",
+              "description": "Server config object for 'add', or changes for 'update'. For stdio: {command, args?, env?}. For URL-based: {url, type?: 'sse'|'http'|'streamable_http', headers?}. Optional: connect_timeout, execute_timeout, sse_read_timeout, disabled, alwaysLoad. Set alwaysLoad=true only for a small core tool set that must remain directly visible; other MCP tools stay deferred. Update also supports args_add, args_remove, and remove_fields string lists."
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    "memory_read": {
+      "aliases": [],
+      "schema": {
+        "name": "memory_read",
+        "description": "Read all long-term memory. Returns core memory (always recalled) and context memory (searchable). Use this to review what has been saved.",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    "memory_search": {
+      "aliases": [],
+      "schema": {
+        "name": "memory_search",
+        "description": "Search topic-sharded context/experience memory by keyword. Use this when the current request may depend on saved user preferences, prior decisions, repo/workflow conventions, previous pitfalls, specific paths or errors, or recurring task experience. Skip it for clearly one-off simple questions. Prefer 1-3 short durable search keys instead of the full user sentence: project/product names, repo/module paths, exact errors, workflows, artifact types, or prior decisions. For compound Chinese requests, split stable noun phrases into separate searches. Core memory is always available — use this for everything else.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search key or short phrase (case-insensitive). Avoid full sentences with action words; use stable nouns such as project names, paths, errors, workflows, or artifact types."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Optional context topic to search, e.g. 'preferences', 'project', 'feedback', or 'general'. If omitted, the memory index routes the query to relevant topics first."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    "memory_write": {
+      "aliases": [],
+      "schema": {
+        "name": "memory_write",
+        "description": "Write to long-term memory that persists across sessions. Use category='core' ONLY when the user explicitly states personal info or preferences (e.g. 'my name is...', 'I prefer...'). Never write summaries or inferences to core. Use category='context' for project context, task patterns, and notes. Context writes are model-merged with existing context when possible.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The content to write. Use markdown bullet points, e.g. '- User prefers Chinese responses\\n- Project uses React'"
+            },
+            "category": {
+              "type": "string",
+              "enum": [
+                "core",
+                "context"
+              ],
+              "description": "'core' for user identity/preferences (always recalled), 'context' for project info/task patterns (searchable). Default: 'core'."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "append",
+                "overwrite"
+              ],
+              "description": "Write mode: 'append' adds to existing (default), 'overwrite' replaces the category."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Optional topic label that buckets context entries into per-topic files (e.g. 'preferences', 'project-x'). Only used when category='context'. Defaults to 'general'."
+            }
+          },
+          "required": [
+            "content"
+          ]
+        }
+      }
+    },
+    "obsidian_create_note": {
+      "aliases": [],
+      "schema": {
+        "name": "obsidian_create_note",
+        "description": "在已绑定的 Obsidian Vault 中新建 Markdown 笔记。写入 Obsidian 时必须优先使用本工具，不要用 bash 直接拼 obsidian create。",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "笔记标题；未提供 path 时用于生成文件名。"
+            },
+            "content": {
+              "type": "string",
+              "description": "要写入笔记的 Markdown 内容。"
+            },
+            "folder": {
+              "type": "string",
+              "description": "可选 Vault 相对文件夹。"
+            },
+            "path": {
+              "type": "string",
+              "description": "可选 Vault 相对 .md 路径；提供后优先于 title/folder。"
+            },
+            "overwrite": {
+              "type": "boolean",
+              "description": "是否覆盖同名笔记。",
+              "default": false
+            },
+            "open_after": {
+              "type": "boolean",
+              "description": "写入后是否打开笔记。",
+              "default": true
+            }
+          },
+          "required": [
+            "title",
+            "content"
+          ]
+        }
+      }
+    },
+    "obsidian_daily_note": {
+      "aliases": [],
+      "schema": {
+        "name": "obsidian_daily_note",
+        "description": "打开、读取、追加或前置写入 Obsidian Daily Note。适合'生成今天的 todo 到 Obsidian'这类请求。",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "open",
+                "read",
+                "append",
+                "prepend"
+              ],
+              "default": "open"
+            },
+            "content": {
+              "type": "string",
+              "description": "append/prepend 时要写入的 Markdown 内容。"
+            },
+            "inline": {
+              "type": "boolean",
+              "default": false
+            },
+            "open_after": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    "obsidian_update_note": {
+      "aliases": [],
+      "schema": {
+        "name": "obsidian_update_note",
+        "description": "追加、前置或覆盖更新已绑定 Obsidian Vault 中的 Markdown 笔记。",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Vault 相对 .md 路径。"
+            },
+            "content": {
+              "type": "string",
+              "description": "要写入的 Markdown 内容。"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "append",
+                "prepend",
+                "overwrite"
+              ],
+              "default": "append"
+            },
+            "inline": {
+              "type": "boolean",
+              "description": "append/prepend 时是否以内联方式写入。",
+              "default": false
+            },
+            "open_after": {
+              "type": "boolean",
+              "description": "写入后是否打开笔记。",
+              "default": true
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    "plan_read": {
+      "aliases": [],
+      "schema": {
+        "name": "plan_read",
+        "description": "Read the current structured plan for the task, if one has been published.",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    "plan_write": {
+      "aliases": [],
+      "schema": {
+        "name": "plan_write",
+        "description": "Publish a structured, user-visible plan for the current task. Use this when the user asks for a plan/proposal, when the approach needs to be shown before substantial work, or when the host UI should render a plan card. This is not an execution progress tracker; use todo_write separately to track completed/in-progress/pending work. Do not use this for greetings, acknowledgements, approval replies, or short messages like ok, continue, confirmed, 好的, 收到, or 继续 unless they also contain a new concrete task. Every call must include action. For action='set', always include a non-empty title and pass steps, verification, risks, and assumptions as JSON arrays, never as JSON-encoded strings.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "set",
+                "clear"
+              ],
+              "description": "Required on every call. Set/replace the plan, or clear it."
+            },
+            "title": {
+              "type": "string",
+              "description": "Short plan title. Required for action='set'."
+            },
+            "objective": {
+              "type": "string",
+              "description": "What the plan is intended to achieve."
+            },
+            "scope": {
+              "type": "string",
+              "description": "Boundaries and non-goals for the work."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "active",
+                "revised",
+                "complete"
+              ],
+              "description": "Plan lifecycle status. Defaults to active."
+            },
+            "steps": {
+              "type": "array",
+              "description": "Ordered plan steps as a JSON array, never a JSON-encoded string. These describe approach, not progress.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "details": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "title"
+                ]
+              }
+            },
+            "verification": {
+              "type": "array",
+              "description": "Checks or commands that should prove the work.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "risks": {
+              "type": "array",
+              "description": "Known risks or uncertainties.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "assumptions": {
+              "type": "array",
+              "description": "Assumptions behind the plan.",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    "query_jsonl": {
+      "aliases": [],
+      "schema": {
+        "name": "query_jsonl",
+        "description": "Stream and inspect a JSONL/NDJSON file with bounded structured output. Use this instead of read_file or execute_code when JSONL records may be large. Optionally filter exact scalar values with where (RFC 6901 JSON Pointer keys) and return only selected fields. Results remain valid JSON; oversized values are replaced by explicit summaries with original sizes. Continue with next_cursor until has_more is false. The source file is never modified.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or relative path to a .jsonl/.ndjson file"
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^/"
+              },
+              "description": "Optional RFC 6901 JSON Pointers to return, for example ['/event', '/timestamp', '/data/error']",
+              "maxItems": 50
+            },
+            "where": {
+              "type": "object",
+              "description": "Optional exact scalar filters keyed by JSON Pointer, for example {'/event': 'tool.response', '/data/success': false}",
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Opaque continuation cursor returned by a previous call"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Maximum matching records to return (default: 20, max: 100)",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            },
+            "scan_limit": {
+              "type": "integer",
+              "description": "Maximum physical records to scan in one call when filters are sparse (default: 500, max: 5000)",
+              "minimum": 1,
+              "maximum": 5000,
+              "default": 500
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    "read_file": {
+      "aliases": [
+        "read"
+      ],
+      "schema": {
+        "name": "read_file",
+        "description": "Read a text file with line numbers and bounded pagination. Use this instead of cat/head/tail or shell commands that print file contents. Output uses 'LINE_NUMBER|LINE_CONTENT' (1-indexed). The default page is 500 lines and the maximum is 2000; use offset and limit to continue through large files. For JSONL logs, especially those with large records, use query_jsonl to filter and project fields instead of returning raw records. Binary and structured document files are rejected with an actionable error. Call it repeatedly to read different files or page through one file.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or relative path to the file"
+            },
+            "offset": {
+              "type": "integer",
+              "description": "Starting line number (1-indexed, default: 1)",
+              "default": 1,
+              "minimum": 1
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Maximum lines to read (default: 500, max: 2000)",
+              "default": 500,
+              "minimum": 1,
+              "maximum": 2000
+            },
+            "refresh": {
+              "type": "boolean",
+              "description": "Force the exact page back into model context even when the same file version and line range are already available",
+              "default": false
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    "report_execution_result": {
+      "aliases": [],
+      "schema": {
+        "name": "report_execution_result",
+        "description": "Report the final, machine-readable result of the current execution to the host after the work and verification are finished. Report only observed changes, checks, limitations, and questions. A completed result requires at least one change, passed checks, and criterion evidence; needs_input requires at least one question. This result does not submit, accept, or authorize work in any external team system: the host owns workflow identity, task versions, context, and submission.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "blocked",
+                "needs_input"
+              ],
+              "description": "Execution outcome; never use completed to mean accepted."
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000,
+              "description": "Concise factual summary of the execution result."
+            },
+            "changes": {
+              "type": "array",
+              "maxItems": 200,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "code",
+                      "document",
+                      "design",
+                      "configuration",
+                      "other"
+                    ]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  },
+                  "reference": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Host-resolvable file, artifact, URL, or other reference."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "summary",
+                  "reference"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "checks": {
+              "type": "array",
+              "maxItems": 200,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "passed",
+                      "failed",
+                      "skipped"
+                    ]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  },
+                  "reference": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000
+                  }
+                },
+                "required": [
+                  "name",
+                  "status",
+                  "summary"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "criteria_evaluations": {
+              "type": "array",
+              "maxItems": 50,
+              "description": "Zero-based evaluations for the host-provided acceptance criteria. Use needs_human when the evidence exists but the criterion requires human judgment.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "criterion_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 49
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "passed",
+                      "needs_human",
+                      "failed"
+                    ]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 2000
+                    }
+                  }
+                },
+                "required": [
+                  "criterion_index",
+                  "status",
+                  "summary",
+                  "evidence"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "known_limitations": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              }
+            },
+            "questions": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              }
+            }
+          },
+          "required": [
+            "outcome",
+            "summary",
+            "changes",
+            "checks",
+            "criteria_evaluations",
+            "known_limitations",
+            "questions"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "request_user_decision": {
+      "aliases": [],
+      "schema": {
+        "name": "request_user_decision",
+        "description": "Pause the current task for one finite, user-visible decision whose options materially change the deliverable, scope, format, or other user-facing outcome. Do not use this for internal implementation choices: choose those yourself. Do not use it for missing facts; use request_user_input instead. Provide 2-6 concise options with stable IDs. You may request a timeout default only when it preserves the user's stated intent, is low-risk, and is reversible. Prefer progress over waiting: when one option safely continues the user's explicit request, put that recommended option first, set it as the default, and request a 30 second timeout. Every call must supply the default, timeout, risk, reversibility, and intent-preservation declarations; the runtime will deny automatic submission for sensitive or unsafe choices. If the model can choose a safe path without changing the user-visible outcome, do not call this tool. The runtime decides whether automatic submission is actually allowed. After calling this tool, end the turn and do not repeat the options in Markdown.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "One concise user-facing decision question."
+            },
+            "decision_kind": {
+              "type": "string",
+              "description": "Stable snake_case category such as delivery_scope, delivery_format, or content_direction."
+            },
+            "options": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 6,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Stable ASCII option identifier."
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "Short user-facing option label."
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "Concise effect or tradeoff of this option."
+                  }
+                },
+                "required": [
+                  "id",
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "default_option_id": {
+              "type": "string",
+              "description": "Option to submit if an allowed timeout expires. Prefer the option that safely continues the user's explicit request without reducing scope."
+            },
+            "requested_auto_submit_seconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 120,
+              "default": 30,
+              "description": "Requested timeout. The runtime may remove it. Requires a default option plus low risk, reversible, and intent-preserving declarations. Request 30 seconds when those conditions hold."
+            },
+            "risk_level": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "description": "Impact if the default is submitted without a click."
+            },
+            "reversible": {
+              "type": "boolean",
+              "description": "Whether the selected branch can be safely undone."
+            },
+            "preserves_user_intent": {
+              "type": "boolean",
+              "description": "Whether the default preserves the explicit user request."
+            },
+            "allow_freeform": {
+              "type": "boolean",
+              "description": "Allow a custom text response instead of an option."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why this user-visible decision is required."
+            }
+          },
+          "required": [
+            "question",
+            "decision_kind",
+            "options",
+            "default_option_id",
+            "requested_auto_submit_seconds",
+            "risk_level",
+            "reversible",
+            "preserves_user_intent"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "request_user_input": {
+      "aliases": [
+        "clarify"
+      ],
+      "schema": {
+        "name": "request_user_input",
+        "description": "Pause the current task when missing user-provided information genuinely blocks a faithful result. Ask one focused question, list only the fields that are actually required, then end the turn. Existing artifacts and the active delivery workflow are preserved; when the user replies in the same session, continue from those artifacts instead of restarting. Do not use this for optional details that can safely be marked as pending or omitted. Never use it for audience, purpose, style, page count, scope, format, or content-direction preferences when you can propose finite choices; use request_user_decision with a recommended default and countdown instead.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "One concise, user-facing clarification question."
+            },
+            "missing_fields": {
+              "type": "array",
+              "description": "The minimal facts or choices required to resume.",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 6
+            },
+            "reason": {
+              "type": "string",
+              "description": "Briefly explain why these fields are necessary and cannot be safely inferred."
+            }
+          },
+          "required": [
+            "question",
+            "missing_fields"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "sandbox_status": {
+      "aliases": [],
+      "schema": {
+        "name": "sandbox_status",
+        "description": "Get the status of Jupyter sandbox sessions.\n\nShows current session ID, all active sessions, whether each kernel is alive,\nand sandbox venv status.\n",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    "search_files": {
+      "aliases": [],
+      "schema": {
+        "name": "search_files",
+        "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in bash. target='content' performs a regular-expression text search; target='files' finds files by glob pattern and is the correct way to inspect a directory. Results are bounded by count and total characters and support offset/limit pagination.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "Regex for content search or glob pattern for file search"
+            },
+            "target": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files"
+              ],
+              "default": "content"
+            },
+            "path": {
+              "type": "string",
+              "description": "Directory or file to search (default: active workspace root)",
+              "default": "."
+            },
+            "file_glob": {
+              "type": "string",
+              "description": "Optional glob limiting files during content search"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 50,
+              "minimum": 1,
+              "maximum": 200
+            },
+            "offset": {
+              "type": "integer",
+              "default": 0,
+              "minimum": 0,
+              "maximum": 10000
+            },
+            "output_mode": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files_only",
+                "count"
+              ],
+              "default": "content"
+            },
+            "context": {
+              "type": "integer",
+              "description": "Context lines before and after content matches (max: 10)",
+              "default": 0,
+              "minimum": 0,
+              "maximum": 10
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    },
+    "sub_agent": {
+      "aliases": [
+        "sessions_spawn",
+        "delegate_task"
+      ],
+      "schema": {
+        "name": "sub_agent",
+        "description": "Delegate one complex, self-contained work unit to an isolated child agent. Use it when independent context, parallel latency, or evidence isolation is worth the startup and merge cost. The parent remains responsible for synthesis, conflicts, final deliverables, and verification.\n\nPass a complete `task` brief. `required_tools` defaults only to available trusted local read tools (`read_file`, `query_jsonl`, `search_files`); pass an explicit minimal list for other work or an empty list for a tool-free task. Explicit tools still pass a fail-closed runtime policy: external side effects and unknown MCP tools are not delegated. Known read-only network tools are enabled only when named explicitly. `bash` is available only when named explicitly and every delegated command requires one-shot parent-session approval. Path-based write tools require an exact `write_scope`, with disjoint scopes for parallel children.\n\nFor the same read-only operation over known local text files, pass their paths in `files`; the runtime uses its bounded completeness-checked batch fast path. Pass `budget` as an object such as `{max_steps:12, max_tool_calls:25}`.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "default": "",
+              "description": "A short, distinct label (about 4-12 characters / 2-6 words) naming what makes THIS unit different from its siblings — e.g. the page topic, file name, or data slice. Do NOT repeat the shared context that every sibling shares (the company name, the common task stem); put only the distinguishing part here. Used as the display label in parallel-task UIs."
+            },
+            "task": {
+              "type": "string",
+              "description": "A clear, self-contained description of the task for the sub-agent to execute. Include all necessary context — the sub-agent cannot see prior conversation history."
+            },
+            "skills": {
+              "type": "array",
+              "description": "Optional Skills whose instructions guide this child. Skills cannot add tools or expand the derived child policy.",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "required_tools": {
+              "type": "array",
+              "description": "Exact parent tools requested for this child. When omitted, defaults to the available trusted local read tools only.",
+              "items": {
+                "type": "string"
+              },
+              "default": [
+                "query_jsonl",
+                "read_file",
+                "search_files"
+              ],
+              "uniqueItems": true
+            },
+            "files": {
+              "type": "array",
+              "description": "Known local text files supplied as child task inputs. When tools resolve to read_file only, runtime uses the bounded batch fast path; additional tools keep the general agent loop.",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "uniqueItems": true
+            },
+            "write_scope": {
+              "type": "array",
+              "description": "Exact artifact-root-relative output paths or directories for write_file, append_file, or edit_file. Required for those tools; parallel children must use disjoint scopes.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "budget": {
+              "type": "object",
+              "description": "Optional numeric limits as a JSON object, for example {\"max_steps\":12,\"max_tool_calls\":25}. Never pass a serialized JSON string.",
+              "properties": {
+                "max_steps": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "max_tool_calls": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "todo_read": {
+      "aliases": [],
+      "schema": {
+        "name": "todo_read",
+        "description": "Read the current todo list. Returns all items or filtered by status. Use this to review progress and decide what to work on next.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "todo_id": {
+              "type": "string",
+              "description": "Optional: get a single item by ID."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "in_progress",
+                "completed"
+              ],
+              "description": "Optional: filter by status."
+            }
+          }
+        }
+      }
+    },
+    "todo_write": {
+      "aliases": [],
+      "schema": {
+        "name": "todo_write",
+        "description": "Manage a todo list for tracking multi-step tasks. Actions: 'set' initializes or substantially revises the full current list in one call, and 'transition' atomically completes the active item and starts the next. Use 'set' only for new or substantially revised multi-step work. Preserve the id of unchanged existing items in the complete ordered todos array. Status-only changes to the same ordered list are rejected; use 'transition' for progress. Existing tasks submitted without their canonical ids are also rejected; call todo_read first if the ids are unavailable. If a set payload has unfinished work but no in_progress item, the first unfinished item is activated automatically. When initializing an empty todo list, omit ids; any supplied ids are ignored and canonical todo ids are assigned automatically. Use 'transition' for normal progress instead of rebuilding the whole list. If a current plan exists, call plan_read before setting todos. Derive the todos from plan steps in order and keep the plan's objective, scope, and verification requirements aligned. A plan step may be split into executable subtasks, but do not omit plan steps, change their meaning, or add unrelated work. Revise the plan with plan_write before materially changing execution. Use this to decompose complex work into trackable steps and mark progress as you go: keep exactly the current item in_progress, mark finished items completed, and move the next item to in_progress before working on it. This tool is only a progress tracker: it is not factual evidence, a search strategy, or a source for final conclusions. Do not narrow the user's request or lower verification standards because a todo exists.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "set",
+                "transition"
+              ],
+              "description": "Operation to perform."
+            },
+            "todos": {
+              "type": "array",
+              "description": "Complete ordered todo list for action='set'. This replaces the current list. Each item requires task and status, with optional priority. When unfinished work remains, zero in_progress items activates the first unfinished item automatically; more than one in_progress item is invalid. An empty or fully completed list must contain none.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Existing todo ID to preserve during action='set'. Omit for a new todo and when initializing an empty todo list; supplied ids are ignored during initialization."
+                  },
+                  "task": {
+                    "type": "string",
+                    "description": "Task description."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ],
+                    "description": "Required task status. If no unfinished item is marked in_progress, the first unfinished item is activated automatically."
+                  },
+                  "priority": {
+                    "type": "string",
+                    "enum": [
+                      "high",
+                      "medium",
+                      "low"
+                    ],
+                    "description": "Priority level. Default: medium."
+                  }
+                },
+                "required": [
+                  "task",
+                  "status"
+                ]
+              }
+            },
+            "todo_id": {
+              "type": "string",
+              "description": "ID of the active todo item for action='transition'."
+            },
+            "next_todo_id": {
+              "type": "string",
+              "description": "Pending todo to activate for action='transition'. Omit to activate the first pending item in list order automatically, or when completing the final unfinished todo."
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    "tool_search": {
+      "aliases": [],
+      "schema": {
+        "name": "tool_search",
+        "description": "Search the connected deferred MCP catalog by capability. Every hit returned by this call is immediately activated for this session and only those activated hits are added to the next model step; other deferred catalog tools are not exposed, while alwaysLoad tools remain visible without search. Use query for one keyword search, queries for independent bilingual or synonymous searches, or tool_names to activate only exact catalog IDs or names. Provide at least one non-empty query, queries, or tool_names input; they may be combined. Prefer short capability, server, or tool keywords; task-specific operands are tolerated but should be omitted when possible. Set top_k to however many matching tool schemas the task actually needs, including ten or more when appropriate. A query hit may activate a protocol-required companion, such as the snapshot paired with managed browser navigation, in addition to top_k. The response reports catalog_tool_count for the applied server scope, matched_count after query limits, and activated_count after conflict filtering; never infer the catalog total from top_k or matched_count. This search activates tools but does not execute them.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "One capability, action, server, or tool keyword query. Kept for compatibility; prefer queries for independent alternatives."
+            },
+            "queries": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Independent keyword queries merged by each tool's best relevance. Use separate Chinese, English, synonym, or exact capability phrases. Prefix matches are supported and unmatched task operands are tolerated."
+            },
+            "tool_names": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Exact tool IDs or names to activate, such as mcp:server/tool or server/tool. No fuzzy fallback is used, and unlisted catalog tools remain hidden."
+            },
+            "server_name": {
+              "type": "string",
+              "description": "Optional exact MCP server name filter."
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "description": "Exact maximum number of query matches to return and activate; ignored for tool_names. Choose any positive count required by the task; there is no small fixed cap. Protocol-required companions may be activated in addition to these query matches. Other unreturned catalog tools remain hidden."
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "write_file": {
+      "aliases": [
+        "write"
+      ],
+      "schema": {
+        "name": "write_file",
+        "description": "Atomically write UTF-8 text to a file, replacing any existing file. Small files need only path and content. For a large file, send ordered chunks to the same path. Start a new transaction with chunk_index=0 and final=false; after an accepted chunk, continue from the next_chunk_index returned by that successful result. Set final=true on the last chunk. The target remains unchanged until the final chunk commits. Transactions support at most 2,048 chunks and 10,485,760 total UTF-8 bytes.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Prefer a path relative to the active project/artifact root (<PROFILE>/workspace). Absolute paths are used exactly as supplied."
+            },
+            "content": {
+              "type": "string",
+              "description": "Complete file content or the current ordered chunk."
+            },
+            "chunk_index": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "description": "Zero-based chunk sequence number (default: 0)."
+            },
+            "final": {
+              "type": "boolean",
+              "default": true,
+              "description": "Commit after this content. Omit or use true for a complete small file; use false until the last chunk of a large file."
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}
