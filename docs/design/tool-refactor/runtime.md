@@ -50,4 +50,4 @@ Skill 的 `get_skill` / 预加载 / 激活 / hash 恢复保持原行为。少量
 
 固定 C1 schema 保持原样；C5 有意差异单独列在 `tests/fixtures/tool_engine/c5_schema_changes.json`。原工具能力、配置组合、实例身份与参数继续逐项对照，不以减少工具数量作为通过标准。
 
-回归与真实任务的当前状态见 [progress.md](progress.md)。源码测试、构建、安装探针、实际宿主和真实任务分别记录。回退整个 Tool PR 可恢复旧装配与执行；没有 Session Log 格式迁移，也无需重构或重新安装原 Skill。
+回归与真实任务的当前状态见 [实施记录](progress.md) 和 [验收结果](verification.md)。源码测试、构建、安装探针、实际宿主和真实任务分别记录。回退整个 Tool PR 可恢复旧装配与执行；没有 Session Log 格式迁移，也无需重构或重新安装原 Skill。

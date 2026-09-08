@@ -76,10 +76,10 @@ Release, provider API, and ACP compatibility have their own sources under
 
 ### 2026-09-09 — Tool Engine ownership and local discovery
 
-- **Change:** `codex/refactor-tool-engine`, based on `d2f665f`; no merge
-  reference yet. [Design](../design/tool-refactor/design.md),
+- **Change:** `codex/refactor-tool-engine`, initially based on `d2f665f` and
+  rebased onto `25868b4`; no merge reference yet. [Design](../design/tool-refactor/design.md),
   [implementation guide](../design/tool-refactor/runtime.md) and
-  [verification record](../design/tool-refactor/progress.md) describe this Tool
+  [verification results](../design/tool-refactor/verification.md) describe this Tool
   phase; the separate Skill Engine phase is not included.
 - **Durable behavior:** `tools/engine/` prepares request-bound definitions and
   real targets, executes calls and streams permission continuations, and
@@ -96,7 +96,9 @@ Release, provider API, and ACP compatibility have their own sources under
 - **Corrections included:** permission retry progress retains the parent call;
   each parallel result uses its own arguments; Hook-modified paths are checked
   again; durability failures propagate; cancellation prevents a new execution
-  attempt. Ordinary failures do not trigger a general automatic retry.
+  attempt. Prepared definitions also retain immutable aliases for provider-side
+  call recovery without adding alias schemas to the model. Ordinary failures
+  do not trigger a general automatic retry.
 - **Proof anchors:** call-record, permission-stream, result-commit, preparation,
   local-discovery, schedule-migration and capability-baseline tests; original
   core/ACP/Skill/session regressions. Exact-Head CI, real-task and packaged-host
