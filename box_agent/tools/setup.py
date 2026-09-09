@@ -49,7 +49,7 @@ from box_agent.tools.runtime import SkillRuntimeContext, build_skill_runtime_con
 from box_agent.tools.skill_execution_env import build_skill_execution_env
 from box_agent.tools.skill_scratch import prepare_skill_scratch_dir
 from box_agent.tools.mcp_config_tool import McpConfigTool
-from box_agent.tools.schedule_tool import PrepareScheduledTaskTool
+from box_agent.tools.schedule_tool import CreateScheduledTaskTool
 from box_agent.tools.skill_tool import create_skill_tools
 from box_agent.tools.sub_agent_tool import SubAgentTool
 from box_agent.tools.todo_tool import TodoReadTool, TodoStore, TodoWriteTool
@@ -310,8 +310,8 @@ async def initialize_base_tools(
     # Pops a pre-filled "create scheduled task" window on the desktop host via
     # ToolResult.raw_output → tool_call_update.rawOutput. Does not persist anything
     # itself; the renderer owns the actual save.
-    tools.append(PrepareScheduledTaskTool())
-    _out(f"{Colors.GREEN}✅ Loaded Scheduled Task tool (prepare_scheduled_task){Colors.RESET}")
+    tools.append(CreateScheduledTaskTool())
+    _out(f"{Colors.GREEN}✅ Loaded Scheduled Task tool (create_scheduled_task){Colors.RESET}")
 
     tools.append(McpConfigTool())
     _out(f"{Colors.GREEN}✅ Loaded MCP Config tool (mcp_config){Colors.RESET}")

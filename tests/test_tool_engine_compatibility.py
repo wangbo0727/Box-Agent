@@ -54,7 +54,7 @@ _C5_SCHEMA_CHANGES = json.loads(
 )
 _C5_DISCOVERABLE = {
     "append_file", "query_jsonl", "bash_output", "bash_kill", "sandbox_status",
-    "mcp_config", "report_execution_result", "prepare_scheduled_task",
+    "mcp_config", "report_execution_result",
     "plan_read", "plan_write", "todo_read", "todo_write", "goal_read", "goal_write",
     "memory_read", "memory_search", "memory_write", "obsidian_create_note",
     "obsidian_update_note", "obsidian_daily_note", "search_skillhub", "install_skillhub_skill",

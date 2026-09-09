@@ -10,7 +10,7 @@ from box_agent.retry import RetryConfig
 from box_agent.schema import Message
 from box_agent.tools.base import Tool, ToolResult
 from box_agent.tools.engine.preparation import prepare_tools
-from box_agent.tools.schedule_tool import PrepareScheduledTaskTool
+from box_agent.tools.schedule_tool import CreateScheduledTaskTool
 
 
 class EchoTool(Tool):
@@ -28,9 +28,9 @@ class EchoTool(Tool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True], ids=["generate", "generate-stream"])
-@pytest.mark.parametrize("scheduled", [False, True], ids=["local-alias", "schedule-old-name"])
-async def test_provider_recovers_legacy_alias_from_prepared_definitions(monkeypatch, streaming, scheduled):
-    tool = PrepareScheduledTaskTool() if scheduled else EchoTool()
+@pytest.mark.parametrize("scheduled", [False, True], ids=["local-alias", "schedule-original-name"])
+async def test_provider_recovers_alias_or_original_builtin_name_from_prepared_definitions(monkeypatch, streaming, scheduled):
+    tool = CreateScheduledTaskTool() if scheduled else EchoTool()
     alias = "create_scheduled_task" if scheduled else "legacy_echo"
     arguments = {"name": "Draft", "prompt": "Show a draft"} if scheduled else {"value": "hello"}
     source = f"<tool_call><function={alias}>" + "".join(

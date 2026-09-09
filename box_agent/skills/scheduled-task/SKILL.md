@@ -1,13 +1,13 @@
 ---
 name: scheduled-task
-description: Helps the user create a recurring or one-off scheduled task through conversation. Load this skill whenever the user wants something done on a schedule (every day / every week / a specific time / "remind me" / periodic reports or monitoring). It explains how to confirm requirements first, translate them into a cron expression, and then call the prepare_scheduled_task tool to pop the pre-filled creation window.
+description: Helps the user create a recurring or one-off scheduled task through conversation. Load this skill whenever the user wants something done on a schedule (every day / every week / a specific time / "remind me" / periodic reports or monitoring). It explains how to confirm requirements first, translate them into a cron expression, and then call the create_scheduled_task tool to pop the pre-filled creation window.
 keywords: [定时, 定时任务, 每天, 每周, 每月, 提醒我, 定期, 周期, 监测, 盯着, 简报, 日报, 周报, schedule, scheduled, cron, recurring, reminder]
 ---
 
 # 定时任务助手（Scheduled Task）
 
 当用户想要"定期/按时"做某件事时（每天、每周、某个时间点、"提醒我"、周期性简报或监测），
-用这个 skill 引导对话，并最终调用 `prepare_scheduled_task` 工具弹出**预填好的创建窗口**。
+用这个 skill 引导对话，并最终调用 `create_scheduled_task` 工具弹出**预填好的创建窗口**。
 
 ## 工作流（必须按顺序）
 
@@ -55,7 +55,7 @@ keywords: [定时, 定时任务, 每天, 每周, 每月, 提醒我, 定期, 周�
 三要素已确认、prompt 已写好后，调用：
 
 ```
-prepare_scheduled_task(
+create_scheduled_task(
   name="世界杯每日战报",
   prompt="<第 4 步写好的完整指令>",
   cron_expr="0 9 * * *",

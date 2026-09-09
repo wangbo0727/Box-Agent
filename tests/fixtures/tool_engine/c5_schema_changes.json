@@ -1,12 +1,6 @@
 {
-  "renames": {
-    "create_scheduled_task": "prepare_scheduled_task"
-  },
-  "aliases": {
-    "prepare_scheduled_task": [
-      "create_scheduled_task"
-    ]
-  },
+  "renames": {},
+  "aliases": {},
   "descriptions": {
     "tool_search": "Search allowed local utilities and the connected deferred MCP catalog by capability. Local utilities include file append, diagnostics, plans, progress, goals, memory, scheduling and integrations when available. Every hit returned by this call is immediately activated for this session and only those activated hits are added to the next model step; other deferred catalog tools are not exposed, while alwaysLoad tools remain visible without search. Use query for one keyword search, queries for independent bilingual or synonymous searches, or tool_names to activate only exact catalog IDs or names. Provide at least one non-empty query, queries, or tool_names input; they may be combined. Prefer short capability, server, or tool keywords; task-specific operands are tolerated but should be omitted when possible. Set top_k to however many matching tool schemas the task actually needs, including ten or more when appropriate. A query hit may activate a protocol-required companion, such as the snapshot paired with managed browser navigation, in addition to top_k. The response reports catalog_tool_count for the applied server scope, matched_count after query limits, and activated_count after conflict filtering; these counts remain MCP-only, with local counts reported separately. server_name selects only MCP tools. Never infer the catalog total from top_k or matched_count. This search activates tools but does not execute them."
   }

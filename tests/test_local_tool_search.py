@@ -9,7 +9,6 @@ import pytest
 from box_agent.tools.base import Tool, ToolResult
 from box_agent.tools.mcp_tool_catalog import MCPToolCatalog
 from box_agent.tools.mcp_tool_search import MCPToolExposureManager, ToolSearchTool
-from box_agent.tools.schedule_tool import PrepareScheduledTaskTool
 from tests.test_mcp_tool_search import FakeMCPTool
 
 
@@ -54,11 +53,11 @@ def setup_search(local_tools, catalog=None):
 async def test_local_exact_alias_is_discoverable_without_waiting_for_mcp():
     catalog = MCPToolCatalog()
     catalog.mark_loading()
-    tool = PrepareScheduledTaskTool()
+    tool = LocalTool("local_lookup", aliases=("legacy_lookup",))
     search, exposure, activated = setup_search([tool], catalog)
     assert exposure.prepare_tools([tool]).offered_names == frozenset()
     result = await asyncio.wait_for(search.execute(
-        tool_names=["create_scheduled_task"], query="unrelated", top_k=1,
+        tool_names=["legacy_lookup"], query="unrelated", top_k=1,
     ), 0.1)
     payload = json.loads(result.content)
     assert result.success

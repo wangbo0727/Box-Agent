@@ -72,17 +72,14 @@ async def test_preparation_preserves_legacy_order_schemas_and_aliases(
         }
     assert {tool.name for tool in legacy_tools} == expected_names
 
-    # C5 deliberately changes only this canonical name and adds its old alias.
-    # Preserve the fixed C1 fixture and compare every other schema field exactly.
-    schedule = agent.tools["prepare_scheduled_task"]
-    assert "prepare_scheduled_task" not in expected_names
-    assert schedule.aliases == ("create_scheduled_task",)
+    # Schedule naming, aliases and every schema field retain the C1 contract.
+    schedule = agent.tools["create_scheduled_task"]
+    assert "create_scheduled_task" in expected_names
+    assert schedule.aliases == ()
     expected_schedule = baseline["create_scheduled_task"]["schema"]
     schedule_schema = _normalized_schema(schedule.to_schema(), isolated_setup.profile)
-    schedule_schema["name"] = "create_scheduled_task"
     assert schedule_schema == expected_schedule
     schedule_openai = _normalized_schema(schedule.to_openai_schema(), isolated_setup.profile)
-    schedule_openai["function"]["name"] = "create_scheduled_task"
     assert schedule_openai == {
         "type": "function", "function": {
             "name": expected_schedule["name"], "description": expected_schedule["description"],

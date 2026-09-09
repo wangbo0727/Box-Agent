@@ -118,15 +118,14 @@ def _validate_fire_at(value: str) -> tuple[bool, str]:
     return True, ""
 
 
-class PrepareScheduledTaskTool(Tool):
+class CreateScheduledTaskTool(Tool):
     """在桌面端弹出"预填好的定时任务创建窗口"，由用户最终确认保存。"""
 
     parallel_safe = False
-    aliases = ("create_scheduled_task",)
 
     @property
     def name(self) -> str:
-        return "prepare_scheduled_task"
+        return "create_scheduled_task"
 
     @property
     def description(self) -> str:
@@ -240,7 +239,3 @@ class PrepareScheduledTaskTool(Tool):
             ),
             raw_output={"kind": SCHEDULE_DRAFT_KIND, "draft": draft},
         )
-
-
-# Keep Python imports compatible; both names construct the same real tool.
-CreateScheduledTaskTool = PrepareScheduledTaskTool

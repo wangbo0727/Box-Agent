@@ -1,4 +1,4 @@
-"""Test cases for the Scheduled Task tool (prepare_scheduled_task).
+"""Test cases for the Scheduled Task tool (create_scheduled_task).
 
 Covers the cross-repo contract with officev3:
 - success → raw_output.kind == "officev3_schedule_draft" with a complete draft
@@ -31,8 +31,8 @@ def tool():
 
 
 def test_metadata(tool):
-    assert tool.name == "prepare_scheduled_task"
-    assert tool.aliases == ("create_scheduled_task",)
+    assert tool.name == "create_scheduled_task"
+    assert tool.aliases == ()
     assert tool.parallel_safe is False
     schema = tool.parameters
     assert schema["required"] == ["name", "prompt"]
