@@ -4,7 +4,7 @@
 
 源码行号对应固定的 2d0646931aa00a665b4661890f5e081ce2cc8430；本轮已拉取并核对最新 main **73cce3060dd708d50b0afff92b3f69acdeaf2d53**。其 PR112 增量见第 2 节，开工和提交 PR 前还需核对后续变更。
 
-交付一个 Tool PR：在现有 tools 包内新增 `box_agent/tools/engine/`，组织目录、模型工具集、执行与结果，继续使用原 Skill 实现。先迁移共同执行，再在同一 PR 落实两档暴露、本地工具发现和明确改名；每项行为变化都有影响和兼容证据。Skill 内部状态重构属于第二个 PR。
+交付一个 Tool PR：在现有 tools 包内新增 `box_agent/tools/engine/`，组织目录、模型工具集、执行与结果，继续使用原 Skill 实现。先迁移共同执行，再在同一 PR 落实两档暴露与本地工具发现（定时任务保持原样）；每项行为变化都有影响和兼容证据。Skill 内部状态重构属于第二个 PR。
 
 技术沿用 Python 3.10+、Tool / ToolResult、asyncio、KernelServices / PluginHost、Session Log、pytest，不新增运行时依赖。本文的 C1–C6 是同一 PR 的内部提交，不是独立发布。
 
@@ -141,7 +141,7 @@ C5 在原 tool_search 增加本地工具候选：保留 query / queries / tool_n
 
 场景组合来自明确的宿主 mode/配置、已有状态（含恢复、暂停与阻塞）和可信 Skill 工具提示表，先能力限制、再合并必要工具，不新增模型意图路由器。禁止隐去仍被宿主必需流程使用的工具；低频工具撤下常驻前，先验证能力目录、精确旧名查找和下一请求实际可调用。会话激活稳定追加；撤权、来源失效和 generation 变化优先于缓存。
 
-这里只延迟完整 schema 的提供，不增加通用延迟实例化。各工具的保留、提供条件和 prepare_scheduled_task 改名以主文档第 3 节为准；不把每个工具都变成必须先搜索。
+这里只延迟完整 schema 的提供，不增加通用延迟实例化。各工具的保留与提供条件以主文档第 3 节为准；定时任务保持原名与原常驻方式；不把每个工具都变成必须先搜索。
 
 ### 4.4 能力清单按实际装配组合建，不按几个常用工具建
 
@@ -332,8 +332,8 @@ ToolStepSummary 由 loop 消费，不能作为 ACP/CLI 事件外发；取消或�
 | 修改 `box_agent/runtime.py`、`box_agent/tools/sub_agent_tool.py` | 直接调用和 batch_files 收拢；不引入子 Agent 多轮循环 |
 | 修改 `box_agent/agent.py`；按需修改 CLI / ACP 装配处 | 移除重复 Tool 结果写方，接装配；保留公开签名、原工具表和全部 Skill 状态 |
 | 修改 `box_agent/tools/mcp_tool_search.py`、`tools/setup.py` 与现有提示构造 | 本地低频候选与 MCP 共用查找入口；有延迟候选就提供搜索；短能力目录与场景工具组 |
-| 修改 `box_agent/tools/schedule_tool.py`、`sub_agent_capabilities.py`、`box_agent/config/system_prompt.md` | 模型规范名 prepare_scheduled_task、旧名入站别名、权限/委派分类与文案同步 |
-| 按实际依赖更新 `box_agent/skills/scheduled-task/SKILL.md` 等工具名称引用 | 保留业务步骤及产物要求；更新 description/正文并按仓库流程生成 `_manifest.json`；旧 Skill 固定测试与新引用测试分别保留，不重构 Skill 状态 |
+| 保留 `box_agent/tools/schedule_tool.py`、`sub_agent_capabilities.py`、`box_agent/config/system_prompt.md` 的定时任务约定 | create_scheduled_task 原名称、Python 类、schema、权限/委派分类不变，不新增迁移别名 |
+| 保留 `box_agent/skills/scheduled-task/SKILL.md` 原文 | 与主分支逐字节对照；原工具引用和工作流均不改，不重构 Skill 状态 |
 | 修改/补充对应 `tests/` | 见第 10 节；不修改业务要求或删除失败用例来迎合测试 |
 
 文件数来自已经存在的职责拆分，不要求为每个工具新建 adapter。现有 scheduler 的 ToolEngine 与新增 DefaultToolEngine 需在导出中明确区分：前者是兼容保留的底层调度器，后者才是本 PR 的完整服务。
@@ -393,9 +393,9 @@ KernelServices 新增字段采用尾部可选字段，旧构造形式保持可�
 
 - [ ] 实现本地低频与 MCP 联合发现；MCP 关闭时仍能查找本地工具，旧 Skill 的精确名字可以抵达目标。
 - [ ] 按主文档第 3 节配置直接/可发现工具；读取原 plan/todo/goal 和进程状态，保留宿主必需的交互与结构化回执。
-- [ ] 将 create_scheduled_task 改为 prepare_scheduled_task，仅展示新 schema；旧名兼容转到同一目标，保留 officev3_schedule_draft payload 和原调用 ID；历史恢复只重建记录/展示，不因旧名映射重新派发草稿。
+- [ ] 保持 create_scheduled_task 原名、schema、Python 类、Skill 文本及常驻提供方式；原 officev3_schedule_draft 与调用 ID 不变；历史恢复不能再次执行工具。
 - [ ] 完成 Skill、提示、setup、子 Agent 分类、日志恢复、配置与测试的变更表。别名不能绕过本次可见性、权限或父会话范围。
-- [ ] 定位实际运行的宿主版本，验证草稿卡片、用户保存边界和交互语义；当前本地 officev3 无消费代码的检索结果不代表无影响。
+- [ ] 核对实际宿主的原草稿事件与保存边界；撤回改名后不再引入工具名称迁移联调。共享执行链的宿主实测与源码/协议测试分别记录，未测不宣称通过。
 
 
 - [ ] 核对 CLI、ACP 各模式、Agent、core/runtime、普通子 Agent、batch_files、ACP 附件路径。
@@ -435,7 +435,7 @@ KernelServices 新增字段采用尾部可选字段，旧构造形式保持可�
 | `tests/test_tool_engine.py`：作用后失败 | 工具已经写标记再报错，不能退到旧实现重做，标记次数仍为一 |
 | `tests/test_isolated_profile.py`、`tests/test_user_paths.py`、`tests/test_mcp_bootstrap.py` | profile 隔离与 managed stdio 环境继承；自定义/HTTP 配置不被误改 |
 | `tests/test_mcp_tool_search.py`、兼容测试：本地发现 | MCP 关闭/连接中不阻塞本地；server_name、top_k、精确优先、companion 与计数兼容；隐藏本地规范名/别名不被远端顶替；下一请求真实可调用 |
-| `tests/test_schedule_tool.py`、alias/子 Agent/宿主探针 | 仅新 schema、旧名入站、原草稿 payload 与消息恢复；不把草稿误报为已保存 |
+| `tests/test_schedule_tool.py`、`tests/test_schedule_tool_contract.py` | 原类/schema/Skill/子 Agent 分类保持；原草稿 payload、调用 ID 与消息恢复不变，不把草稿误报为已保存 |
 | 兼容测试与任务对照：工具组 | 宿主必需工具直接提供；原 Skill 所需能力可达；无活动状态时仍可发现 plan/todo/goal；没有可见性绕权 |
 | `tests/test_bash_tool.py`：动态辅助工具 | 活动与已结束未读输出都可获取；跨 turn / owner 行为正确；失效句柄不会启动新命令 |
 | 新进程与 wheel import 检查 | tools/kernel 公开 import 和兼容入口无循环依赖，新文件真实打入安装包 |
@@ -510,7 +510,7 @@ bash general_review/ci/preflight.sh
 
 ### 10.4 工具集合效果也要单独验证
 
-C2–C4 的共同链路先用原工具集合对照，C5 再固定同一 Skill/模型/任务测试提供策略和改名，避免把所有效果归给目录迁移。记录任务与产物、误选、参数错误、发现轮数和失败、schema token、总输入、缓存以及延迟。旧 Skill 不改名的兼容证据与引用迁移后的效果分开。
+C2–C4 的共同链路先用原工具集合对照，C5 再固定同一 Skill/模型/任务测试提供策略，避免把所有效果归给目录迁移。记录任务与产物、误选、参数错误、发现轮数和失败、schema token、总输入、缓存以及延迟。原 Skill 引用保持不变；历史含改名的评测不能冒称当前版本的效果。
 
 工具数减少不是合并理由。若某类低频工具搜索增加任务失败或成本，就把该类工具恢复为直接提供并更新策略表，复测相关场景；不必推翻共同执行设计，也不新增长期双执行器。原能力和授权边界是硬约束。
 
@@ -526,7 +526,7 @@ C2–C4 的共同链路先用原工具集合对照，C5 再固定同一 Skill/�
 
 当前 Tool PR 包含结构收拢、本地发现、工具集合调整、名称迁移及相应验证，合计暂估 12–20 人日（含准备）；旧 9–14 人日只覆盖结构收拢。实际宿主、权限/日志与全入口覆盖是主要不确定性，C1 后修订估计。一个 PR 是交付约束，不意味着一次巨大提交；C1–C6 可分别审查。
 
-本 PR 明确调整主文档列出的常驻集合与定时任务规范名，兼容旧调用、配置、宿主事件和完整任务能力。第 2.3 节修复与 C5 的产品可见变化分别说明。不引入自动 Provider 替换、通用恢复平台、热卸载、强制 Skill manifest 或 Hermes 新并发策略；Skill 内部状态仍留给第二个 PR。
+本 PR 调整主文档列出的低频工具集合，但定时任务保持原名与原常驻方式，兼容原调用、配置、宿主事件和完整任务能力。第 2.3 节修复与 C5 的产品可见变化分别说明。不引入自动 Provider 替换、通用恢复平台、热卸载、强制 Skill manifest 或 Hermes 新并发策略；Skill 内部状态仍留给第二个 PR。
 
 回退发生在构建与进程边界，使用同一 profile 下的上一构建或撤回 Tool PR。先停止接受新任务，让活动会话和后台任务完成，或按已有受支持方式处理后，再切换构建并验证恢复。宿主确实支持并存版本时，才可让旧进程完成原会话、新会话使用上一构建；未具备这种部署方式时不承诺无中断回退。回退不能触发历史调用重新执行，也不回滚外部已完成操作。不为迁移新增长期保留的两套执行框架或公共配置组合。
 

@@ -2,7 +2,7 @@
 
 ## 交付边界
 
-本分支只交付 Tool 阶段一个 PR，保留原 Skill 实现。以 [设计](design.md) 和 [实施明细](implementation.md) 为完整要求；下表是跟踪索引，不缩减原要求。主分支保持原完整能力，Tool PR 验证完成后才可合并；Skill 重构另一个 PR。维护者决定合并。代码和安装包验证已完成，桌面交互仍待补齐，暂不标记可合并；完整版本、结果和局限见 [验收结果](verification.md)。
+本分支只交付 Tool 阶段一个 PR，保留原 Skill 实现。以 [设计](design.md) 和 [实施明细](implementation.md) 为完整要求；下表是跟踪索引，不缩减原要求。主分支保持原完整能力，Tool PR 验证完成后才可合并；Skill 重构另一个 PR。维护者决定合并。历史版本已完成源码、安装包和 ACP 验证。本轮撤回定时任务改名并处理独立 review 的发现；准确新 Head 的检查与审查状态见 PR Proof，桌面未实测边界继续明示；完整版本、结果和局限见 [验收结果](verification.md)。
 
 ## 分支和版本
 
@@ -27,12 +27,15 @@
 10. 基线评测发现附件虽已复制，却没有进入 ACP prompt。评测器现在保持原问题文本，附加标准 resource_link 和路径索引；baseline / PR 使用同一修复，附件字节不变，也不放宽 allowed_dirs。旧的缺失输入尝试保留，不能用于产物对照。
 11. 上游 main 又推进到 25868b4（PR106，PPTX Skill 导出修复）。集成前 rebase；PPT 另补同版本 Skill 的 main 对照，旧 d2 基线保留。没有把上游 Skill 修改作为本 PR 的重构收益。
 12. 实施中修复了两项直接影响共同链路的问题：授权等待期间取消后不得再执行副作用；eager MCP 也必须保留并检查本次定义的 generation。新增失败回归先复现，再验证修复。
-13. scheduled-task 只改三处工具引用。没有在总 system prompt 额外重复定时任务说明；原提示长度约束继续生效。生成器已运行，scheduled-task 不在当前打包 manifest 的 12 个条目中，仅时间戳变化不纳入补丁。
+13. 初版 scheduled-task 只改三处工具引用（本轮已撤回，见第 19 项）。没有在总 system prompt 额外重复定时任务说明；原提示长度约束继续生效。生成器已运行，scheduled-task 不在当前打包 manifest 的 12 个条目中，仅时间戳变化不纳入补丁。
 14. C2–C5 的服务装配、共同执行、结果提交和发现策略相互依赖，作为一个 Tool 子系统实现提交审阅；C1 对照夹具和 ACP 评测器修复独立提交。仍只交付一个 Tool PR。
 15. 提交的代码索引停在 fb261b3，已按实际源码核对涉及模块；当前没有可调用的 /understand 生成器，未手改 graph/meta/fingerprints。索引刷新待具备该工具的环境执行。
 16. 独立审查发现 provider 的 SenseNova 调用恢复也读取 Tool.aliases。725e2d8 在冻结定义中补上不可变别名，新增普通/stream 实际 provider 路径的回归；不额外把旧名放入模型 schema。
 17. PR 首次 TTS 在 plan_write 后等待客户端批准。保留原尝试，另建 main/PR 同样显式 auto_approve_plan=true 的补对照，避免把协议完成错当文件交付。
 18. 隔离桌面副本的 ad-hoc 签名通过静态验证，但实际启动被 dyld library validation 拒绝。源码、wheel、ACP 均已验证，实际草稿/决策交互仍未完成；原应用与系统安全设置保持原样。
+
+19. 2026-09-09 用户要求定时任务保持原样：恢复 create_scheduled_task 原名、Python 类、schema、Skill 原文、子 Agent 分类及常驻提供方式；不做名称迁移。
+20. 本轮独立 review 确认两项回归：取消调用遗留一次性授权（P1），无 system 前缀的 direct loop 重复持久化工具结果（P2）。均先复现再修复；原触发的最终提交复测结论与准确 Head 门禁写入 PR Proof。
 
 ## 完成清单
 
@@ -42,7 +45,7 @@
 | C2 | tools/engine、唯一会话对象、准备定义/别名/目标、服务装配 | 已实现并做定向验证；冻结 schema 与真实对象、别名、来源、generation，PluginHost 可注入，关闭不销毁借用资源 |
 | C3 | 共同执行、流式权限继续、上下文、拒绝/取消/失败政策 | 已实现并做定向验证；主循环、公共 runtime、子 Agent 批量读取共用单次调用与权限链；批准后进度实时转发，取消不启动下一次尝试 |
 | C4 | 共同结果完成、唯一消息提交、原 Skill 桥、业务处理归位 | 已实现并做定向验证；每条调用拥有最终参数，串并行共用收尾；日志写方唯一；原 Skill、图片、资源、搜索与产物行为迁移到所属模块 |
-| C5 | 两档暴露、本地/MCP 发现、规范名迁移、全入口收口 | 已实现；全量与真实 ACP 任务验证可达，定时任务新规范名与旧名兼容。真实宿主尚未完成运行验证 |
+| C5 | 两档暴露、本地/MCP 发现、全入口收口 | 已实现；定时任务按用户要求保持原样，无新增名称迁移；原草稿与恢复契约回归保留 |
 | C6 | 全回归、ACP 真实任务与产物、打包安装探针、实际宿主、最终 Head 门禁与 PR | 部分完成：725 全量 3846 passed；wheel 非 editable 安装及 918 文件探针、真实 ACP 与独立产物诊断完成。桌面交互与最终发布门禁待补；PR 保持 Draft |
 
 ## 验收维度
@@ -54,7 +57,7 @@
 | 授权执行 | 最终参数复核、多权限门、实时进度、并行审批顺序、取消、无盲目重放、直接调用 | permission_stream / permission_negotiation / sub_agent / call_records 用例已覆盖 |
 | 结果与恢复 | 一次 call/result、原结果通道、图片安全、参数归属、Skill active/preload/direct core、后台句柄 | call_records / result_commit / 原 pipeline 与 Session Log 用例已覆盖；实际 Agent 多次权限尝试仍只有一次 call/result，图片只进入瞬态模型上下文 |
 | 工具集合 | 本地搜索不被 MCP 等待阻塞、精确旧名可达、隐藏名保护、必要工具直接提供、子权限无扩大 | local_tool_search / local_tool_exposure / MCP / ACP / 子 Agent 用例已覆盖 |
-| 改名与宿主 | prepare_scheduled_task 新 schema、旧名兼容、原草稿事件、历史不重放、manifest、真实宿主 | 源码与恢复用例通过；已核对安装宿主 1.0.28 的实际消费代码，未声称已完成宿主重启或实际交互 |
+| 定时任务兼容 | 原 create_scheduled_task 名称、schema、常驻方式、Skill 原文、草稿事件及历史不重放 | 本轮撤回迁移并补原样对照；真实桌面交互未测，不再把名称迁移联调列为本 PR 要求 |
 | 端到端 | 固定模型/Skill/配置/预算/输入的 ACP 基线与新实现；文件、复杂搜索/委派、PPT 产物 | d2 与 PR 完成；258 同 Skill PPT、同 auto-plan TTS 补对照完成。PDF、Markdown、HTML 文件交付与内容质量分开记录 |
 | 收益 | 任务成功、误选、参数错误、发现轮数、schema/总 token、缓存、延迟 | 已从 trace 提取；首轮定义 30→16–18，但两条补对照的总 token 增加。没有缓存字段，不推断缓存或整体效率收益 |
 | 工程 | 新进程 import、完整 preflight、wheel 安装/探针、准确最终 Head、只一个 Tool PR | 评测器 113 passed；725 全量 3846 passed / 18 skipped / 1 deselected；sdist/wheel、安装探针与 wheel ACP smoke 通过。正式 required CI/review 不能由本地结论替代 |

@@ -108,7 +108,7 @@ flowchart TD
 | sandbox_status | 从普通常驻面撤下，保留诊断发现和 CLI 入口 | 状态诊断有用，但不是每轮任务的必需说明 |
 | mcp_config | 从普通任务常驻面撤下，管理场景/相关 Skill 直接提供，其余可发现 | 现有 mcp-config、browser-use Skill 需要它；写配置不等于连接成功 |
 | report_execution_result | 需要结构化执行回执的宿主流程直接提供，普通任务可发现 | 不能以自然语言 final 替代宿主需要的机器回执，也不能把模型报告当独立验证事实 |
-| create_scheduled_task | **模型名改为 prepare_scheduled_task**；旧名入站兼容 | 当前只发送预填草稿，用户保存结果未知；新名应准确表达能力，不宣称“已创建” |
+| create_scheduled_task | **保持原名、原 schema 和常驻提供方式**，本 PR 不做名称迁移 | 仍只发送预填草稿，用户保存结果未知；原工具描述和 Skill 继续说明保存边界 |
 | request_user_input、request_user_decision | 本 PR 保留两种语义和独立入口，交互场景按宿主支持直接提供 | 一个补缺失事实，一个给有限选项且可能有受限超时默认；合成一个入口会引入参数分支和宿主迁移，本次没有效果证据证明更简单 |
 | plan_read/write、todo_read/write、goal_read/write | 保留不同状态语义，改变提供条件，见下节 | 方案审批、执行进度、跨轮持久目标不是同一状态 |
 | memory、Obsidian、SkillHub、普通 MCP | 有相应能力时进入目录；按场景直接提供或搜索追加 | 保留各自权限和配置条件。SkillHub 实际模型名是 search_skillhub / install_skillhub_skill |
@@ -116,7 +116,7 @@ flowchart TD
 
 当前默认并没有注册 staged_file_write；VisionReviewTool 已是 Python import 兼容别名，也不是额外暴露的一份模型 schema。不能把它们计作“这次删掉的冗余默认工具”。
 
-**本次确定删除的，是普通模型面中无关的常驻说明，以及改名后重复的新旧 schema；不是未经验证删除底层能力。** 若实现中发现某入口的能力已由另一条路径完整覆盖，可以在同一 PR 的删改表中补充彻底移除，但必须先提供影响证据。不会为了显得重构彻底而预先凑删除数量。
+**本次确定删除的，是普通模型面中无关的常驻说明；不新增重复 schema，也不未经验证删除底层能力。** 若实现中发现某入口的能力已由另一条路径完整覆盖，可以在同一 PR 的删改表中补充彻底移除，但必须先提供影响证据。不会为了显得重构彻底而预先凑删除数量。
 
 ### 3.3 plan、todo、goal 怎样避免同时干扰模型
 
@@ -261,7 +261,7 @@ request_user_decision 的低风险超时默认不适用于权限批准；用户�
 
 保持现有 flush 边界，不增加每结果 fsync；rawOutput 使用原脱敏后的事件数据，不能把截图字节写进持久日志。结果处理失败也不能回退旧执行器重跑。
 
-prepare_scheduled_task 的例子体现这一原则：工具成功只说明发出了草稿，用户是否保存尚未知，不能报告定时任务已创建。
+create_scheduled_task 的原行为体现这一原则：工具成功只说明发出了草稿，用户是否保存尚未知，不能报告定时任务已创建。
 
 ## 8. 具体落点：都在 tools 内，主循环只保留对话控制
 
@@ -310,13 +310,13 @@ Engine 每 outer run 创建，借用原会话工具表、MCP activation/exposure
 
 | 调整 | 已确认的影响位置 | 合并前必须证明 |
 | --- | --- | --- |
-| create_scheduled_task → prepare_scheduled_task | `tools/schedule_tool.py`、`setup.py`、`sub_agent_capabilities.py`、`box_agent/skills/scheduled-task/SKILL.md` 及生成的 `_manifest.json`、`tests/test_schedule_tool.py`；原事件 kind 为 officev3_schedule_draft | 新名 schema、旧名调用和历史展示均可用；恢复不重放调用、不再弹草稿；子 Agent 外部副作用分类不丢；实际宿主仍处理原草稿事件，不误报已保存 |
+| create_scheduled_task 保持原样 | 原工具实现、Python 类、schema、Skill 文本与子 Agent 分类保持主分支版本；仍常驻提供 | 对照固定 C1 schema；检查原名执行、officev3_schedule_draft、调用 ID、保存边界与历史不重复执行；本 PR 不再引入工具改名的前端联调 |
 | 本地工具从常驻改为可发现 | `tools/mcp_tool_search.py` 目前只有 MCP；Agent 提示、setup、CLI/ACP 模式；mcp-config/browser-use/PPT 等 Skill 引用 | MCP 关闭时仍能找到本地工具；显式 Skill 路径可达；原宿主要求的交互/回执直接可见 |
 | 后台辅助工具动态提供 | `bash_tool.py` 的 owner、output、turn/runtime 生命周期；setup 会话绑定；恢复日志里的 bash_id | 已结束未读输出仍可读；跨 turn 仍可用；跨 owner 拒绝；进程不存在时不重启命令冒充恢复 |
 | plan/todo/goal 提供条件变化 | Agent 状态与按名持久化、loop 审批、CLI 目标续跑、Session Log 三类记录、PPT 方法 | 方案审批不被跳过，todo 原子推进保持，goal 恢复与自动续跑正确 |
 | 用户交互合并候选 | 两个 Tool、system prompt、PPT references、ACP 两种 payload；本 PR 不实施合并 | 若以后合并，必须验证真实宿主卡片、等待/恢复、倒计时与禁止自动审批，不能仅看参数能合并 |
 
-**实际宿主版本仍是未验证项。** 本轮检索的本地 officev3 checkout 没找到这些新 payload 消费实现，不能据此断言没有消费者或改名无影响。必须在实现 PR 合并前定位实际运行宿主/版本并完成协议探针。名称方案可以先确定，兼容证据不足时不能完成发布。
+**实际宿主版本仍是未验证项。** 本轮检索的本地 officev3 checkout 没找到这些新 payload 消费实现，不能据此断言没有消费者或改名无影响。必须在实现 PR 合并前定位实际运行宿主/版本并完成协议探针。2026-09-09 根据用户要求撤回定时任务改名；该工具的名称与提供方式均保持原样，不再要求改名迁移验收。其他共享执行变化的协议与宿主验证仍须如实报告。
 
 自带 Skill 的工具引用需同步时，保留业务逻辑和产物要求，记录 hash 变化；description 和正文一并核对，按仓库流程重新生成 `_manifest.json` 并检查差异。验证分两类：固定旧 Skill 验证兼容入口，新引用验证目标行为；不能改简单版 Skill 来掩盖工具能力缺失。
 
@@ -330,7 +330,7 @@ Engine 每 outer run 创建，借用原会话工具表、MCP activation/exposure
 | C2 | 在 tools/engine 中接统一目录、请求定义和原调度 | 先保持原行为，说明/对象对应；没有第二套会话资源 |
 | C3 | 收拢执行与权限链，落实失败/重试政策 | 获准后事件连续；并行审批顺序不变；不盲目重做未知操作 |
 | C4 | 统一结果/日志并接原 Skill | 一次最终回复、原多模态/产物/恢复保持；无重复写入 |
-| C5 | 实现两档暴露、本地工具发现和明确改名，关闭影响表 | 原低频能力可找到；新旧名兼容；宿主/Skill/权限/配置都核对 |
+| C5 | 实现两档暴露与本地工具发现，保持定时任务原样并关闭影响表 | 原低频能力可找到；定时任务无名称迁移；宿主/Skill/权限/配置都核对 |
 | C6 | 完整回归与任务对照，最终 Head 门禁和 PR 材料 | 保能力与模型工具集收益分别有证据，之后一个 PR 合并 |
 
 这些是内部提交，不是六个 PR。主分支在开发期间保持原完整版本；本 Tool PR 完整验收后才合并，不需要等第二个 Skill PR。
@@ -350,7 +350,7 @@ Engine 每 outer run 创建，借用原会话工具表、MCP activation/exposure
 
 新暴露策略的对照先固定同一份 Skill、输入、配置、模型和预算；命名引用迁移另标证据。保留任务产物要求，外部环境缺失与关键测试 skip 如实记录。已有 pytest 全绿也不能代替宿主真实任务与 PPT 产物验证。
 
-工作量也需更新：原 9–14 人日只估了结构收拢；加入本地发现、工具集合调整和改名影响验证后，Tool PR 暂估 **12–20 人日**，在 C1 确定真实宿主和覆盖后修订。时间不足调整排期，不能删除能力来通过验收。
+工作量也需更新：原 9–14 人日只估了结构收拢；加入本地发现、工具集合调整和兼容影响验证后，Tool PR 暂估 **12–20 人日**，在 C1 确定真实宿主和覆盖后修订。时间不足调整排期，不能删除能力来通过验收。
 
 ## 11. 四个参考项目对本设计的实际帮助
 

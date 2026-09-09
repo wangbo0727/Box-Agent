@@ -1,6 +1,8 @@
 # Tool PR1 验收结果
 
-本次已经完成 Tool 代码重构和源码、安装包、ACP 任务验证。原 Skill 实现保留。**桌面端草稿/决策的实际交互仍未验完，因此 PR 暂不标记为可合并。** 工具能力可达、文件交付、产物质量和桌面消费是不同的验收项。
+本次保留原 Skill 实现。下文记录每个历史版本实际执行过的验证；最新 PR Head 的完整门禁与独立审查结论以 PR Proof 为准，不把旧版本结果当作新版本实测。工具能力可达、文件交付、产物质量和桌面消费分别验收。
+
+2026-09-09 根据用户要求撤回定时任务改名，恢复原 create_scheduled_task 的名称、Python 类、schema、Skill 原文及常驻提供方式。新增原样对照及原草稿/历史恢复回归，不再引入改名的前端联调。独立 review 另发现一次性授权在取消后残留（P1）与无 system 前缀时工具结果重复持久化（P2）；均补失败复现后修复，精确提交和复审结果记于 PR Proof。
 
 ## 1. 版本与环境
 
@@ -26,7 +28,7 @@
 | 725 完整 preflight | 3846 passed、18 skipped、1 deselected、1 warning；427.64 秒；sdist/wheel 成功 | 修复后的完整源码回归 |
 | ACP 评测器测试 | 113 passed | 显式 metadata、原附件及路径索引正确进入标准 ACP；基线和 PR 共用修复 |
 | Provider 别名回归 | 新增 5 个用例先失败；修复后相关 114 个用例通过 | 普通/stream 的 SenseNova 恢复路径保留旧名；模型 wire 仍只提供规范名 |
-| 本地独立代码复审 | 原 P1 的同一触发已复核；未发现未解决 P0/P1/P2 | 本地代码结论；不是 GitHub `teamwork/local-ci` 或部署审查系统的状态 |
+| 725/8c 当时的本地审查 | provider 别名 P1 当时已修复；该轮未发现后续两项问题 | 历史审查不保证无缺陷；本轮新的独立 review 与修复必须单独复验 |
 
 完整命令是 `UV_PYTHON=/Users/wangbo4/.local/bin/python3.11 bash general_review/ci/preflight.sh`。路径指向本机 uv 管理的解释器；其他机器应选择自己的 uv-managed Python。唯一 deselect 是仓库脚本原有的 unreachable MCP timeout 用例，没有为本 PR 扩大排除范围。
 
@@ -72,13 +74,13 @@ C2–C4 先用固定 C1 定义、原集合与组合回归证明结构兼容；C2
 | ACP 新进程 | 没有 box_agent 源码的独立 runner 使用已安装 wheel，smoke 完成，32,444 tokens、2 次计费响应 |
 | 桌面消费代码 | 只读核对已安装 1.0.28：定时草稿按 `officev3_schedule_draft` 与调用 ID 消费/去重，不按旧工具名；决策请求保留原 ID/metadata |
 | 隔离宿主启动 | 路径适配副本的首次启动被 dyld library validation 拒绝；ad-hoc 与 hardened runtime 无真实 Team ID，尚未进入 main、ACP 或 UI。原应用没有替换/重启 |
-| 尚缺的实际交互 | 新规范名触发草稿并取消、用户决策返回后继续、历史恢复不重放；源码测试和消费代码审阅不替代这些实测 |
+| 尚缺的实际交互 | 原桌面草稿、决策返回与历史恢复的真实点击操作未测；定时任务名称迁移已撤回，不能仍以新规范名联调为缺口 |
 
 隔离副本只适配路径、runtime 位置与测试系统集成，不改原 renderer/IPC 业务逻辑；即使后续在开发宿主验证成功，也必须标为“复用原消费代码的开发宿主”，不能写成未经改动的发布应用已经验证。没有修改系统安全设置，也没有使用个人签名私钥。
 
 ## 6. 合并条件与回退
 
-桌面实际交互证据补齐、准确最终 Head 的 required CI/review 通过并经维护者确认之前，保持 Draft。当前仓库索引停在 fb261b3；源码已直接核对，没有手工伪造图谱刷新。原 Skill Engine 的发现/调度问题不在本 PR 中悄悄扩展。
+准确最终 Head 的 required CI/review 及维护者确认仍是合并条件。真实桌面未实测、模型任务质量与运行成本的残余风险须在 PR 明示；Computer Use 只是可选验收手段，不是 Tool Engine 依赖。本轮保持 Draft 等待修复后的独立审查与门禁。当前仓库索引停在 fb261b3；源码已直接核对，没有手工伪造图谱刷新。原 Skill Engine 的发现/调度问题不在本 PR 中悄悄扩展。
 
 没有 Session Log 格式或配置迁移。回退整个 Tool PR/运行时构建，按原部署方式结束活动任务并启动上一构建；历史调用不重执行，外部已完成操作不回滚。不在请求中途切换到旧执行器补做副作用。
 

@@ -19,7 +19,7 @@ flowchart TD
     J --> A
 ```
 
-图中的授权继续属于同一条模型调用，不重复扣预算、不重发开始 Hook；进度实时经过原事件通道。普通失败、超时或副作用是否完成未知时，不自动重放。并行首轮收齐之后，授权按原输入顺序继续；等待授权不计入首轮批次超时。
+图中的授权继续属于同一条模型调用，不重复扣预算、不重发开始 Hook；进度实时经过原事件通道。一次性授权只在调度器确认本次调用未取消后、实际 invoke 开始前写入，不能给后续调用留下授权。普通失败、超时或副作用是否完成未知时，不自动重放。并行首轮收齐之后，授权按原输入顺序继续；等待授权不计入首轮批次超时。
 
 ## 代码按什么职责拆开
 
@@ -34,7 +34,7 @@ flowchart TD
 | `kernel/tool_messages.py` | 执行前记录最终参数，提交最终回复，修复中断历史 | 串行立即 flush，并行统一 flush 后再启动；Agent 不重复处理结果事件 |
 | `tools/local_tool_exposure.py`、`mcp_tool_search.py` | 基础/必要工具直接提供，低频工具搜索后追加 | 完整能力表不变；别名、父子范围、generation 和权限仍生效 |
 
-`kernel/tool_engine.py`、`permission_gateway.py`、`tool_result_pipeline.py`、`state.py` 保留原符号的兼容导出。它们不保留第二套执行逻辑。`ToolEnginePort` 由原 composition / PluginHost 解析；CLI、ACP 不需要自行构造 Engine。
+`kernel/tool_engine.py`、`permission_gateway.py`、`tool_result_pipeline.py`、`state.py` 保留原符号的兼容导出。它们不保留第二套执行逻辑。`ToolEnginePort` 已接入原 composition / PluginHost，可由插件提供实现；CLI、ACP 不需要自行构造 Engine。显式插件注入已由真实外层循环测试覆盖。默认生产路径仍在 PluginHost 未提供该服务时由 AgentLoopKernel 创建 DefaultToolEngine，未完全做到默认引擎经插件工厂创建；这是当前装配边界，不宣称默认实现已完全插件化。
 
 ## 工具与 Skill 怎样配合
 
@@ -44,7 +44,7 @@ flowchart TD
 
 Skill 的 `get_skill` / 预加载 / 激活 / hash 恢复保持原行为。少量明确的 Skill 工具提示只调整已有能力的可见性，不能注册新能力或授予权限。第二阶段才重构 Skill Engine。
 
-定时任务只改模型规范名为 `prepare_scheduled_task`，旧 `create_scheduled_task` 及 Python 类名兼容。宿主仍收到 `officev3_schedule_draft`，用户是否保存仍未知；恢复旧消息不会重新执行或再次派发草稿。
+定时任务保持原 `create_scheduled_task` 名称、Python 类、完整 schema、常驻提供方式与 Skill 原文，本 PR 不做名称迁移。宿主仍收到 `officev3_schedule_draft`，用户是否保存仍未知；恢复旧消息不会重新执行或再次派发草稿。
 
 ## 验证与迁移
 
