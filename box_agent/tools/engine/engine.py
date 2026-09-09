@@ -288,8 +288,11 @@ class DefaultToolEngine:
                     result=result, permission_negotiator=context.permission_negotiator,
                     tool_name=call.name, tool=call.target, arguments=call.arguments,
                     retry_offer_error=lambda: prepared.validate_call(call.name),
-                    retry_records=lambda: self._scheduler.invoke_serial(
-                        ToolInvocationRequest(call.call_id, call.name, call.arguments)
+                    retry_records=lambda approval: self._scheduler.invoke_serial(
+                        ToolInvocationRequest(
+                            call.call_id, call.name, call.arguments,
+                            approved_permission_request=approval,
+                        )
                     ),
                     on_retry=lambda retry: self._log_result(call, retry),
                 )) as records:

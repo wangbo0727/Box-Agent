@@ -53,7 +53,7 @@ async def invoke_tool_with_permissions(
     repeated-request boundaries as ordinary model-selected tools.
     """
 
-    def attempt_records(*, first_attempt: bool = False):
+    def attempt_records(approval: dict[str, Any] | None = None, *, first_attempt: bool = False):
         return stream_tool_invocation(
             tool,
             arguments,
@@ -61,6 +61,7 @@ async def invoke_tool_with_permissions(
             is_cancelled=is_cancelled,
             # Preserve the standalone first-attempt exception payload below.
             passthrough_exceptions=(Exception,) if first_attempt else (),
+            approved_permission_request=approval,
         )
 
     async def forward_progress(record: ToolEngineProgress) -> None:

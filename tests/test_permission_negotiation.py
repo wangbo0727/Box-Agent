@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -1176,7 +1177,9 @@ async def test_permission_stream_relays_progress_and_activity_before_final_resul
     stream = stream_tool_permission_chain(
         result=first_result, permission_negotiator=SafetyNegotiator(grant=True),
         tool_name=tool.name, tool=tool, arguments={}, retry_offer_error=lambda: None,
-        retry_records=lambda: scheduler.invoke_serial(request), on_retry=retried.append,
+        retry_records=lambda approval: scheduler.invoke_serial(
+            replace(request, approved_permission_request=approval)
+        ), on_retry=retried.append,
     )
     try:
         assert await asyncio.wait_for(anext(stream), 0.5) == ToolEngineProgress(event="original-parent")

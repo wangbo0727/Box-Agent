@@ -49,6 +49,7 @@ async def stream_tool_invocation(
     invocation_context: ToolInvocationContext | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     passthrough_exceptions: tuple[type[BaseException], ...] = (),
+    approved_permission_request: dict[str, Any] | None = None,
 ) -> AsyncIterator[ToolEngineRecord]:
     """Schedule one standalone attempt with an owned progress queue."""
     # Local import keeps the scheduler -> invoke_tool_once dependency acyclic.
@@ -76,6 +77,7 @@ async def stream_tool_invocation(
         tool_name=tool_name,
         arguments=arguments,
         invocation_context=invocation_context,
+        approved_permission_request=approved_permission_request,
     )
     async with aclosing(scheduler.invoke_serial(request)) as records:
         async for record in records:
@@ -149,7 +151,7 @@ async def stream_tool_permission_chain(
     tool: Tool | None,
     arguments: dict[str, Any],
     retry_offer_error: Callable[[], str | None],
-    retry_records: Callable[[], AsyncIterator[ToolEngineRecord]] | None = None,
+    retry_records: Callable[[dict[str, Any]], AsyncIterator[ToolEngineRecord]] | None = None,
     on_retry: Callable[[ToolResult], None] | None = None,
 ) -> AsyncIterator[ToolEngineRecord | PermissionChainCompleted]:
     """Negotiate distinct permission gates until the tool can execute.
@@ -258,11 +260,12 @@ async def stream_tool_permission_chain(
                 error=f"Unknown tool: {tool_name}",
             )
         else:
-            _approve_tool_permission(tool, permission_request)
             records = (
-                retry_records()
+                retry_records(permission_request)
                 if retry_records is not None
-                else stream_tool_invocation(tool, arguments)
+                else stream_tool_invocation(
+                    tool, arguments, approved_permission_request=permission_request,
+                )
             )
             async with aclosing(records):
                 async for record in records:
