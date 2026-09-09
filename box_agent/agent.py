@@ -53,6 +53,7 @@ from .tools.mcp_tool_search import (
     ToolSearchTool,
 )
 from .skill_runtime import SkillRuntime
+from .skill_dependencies import SkillDependencyError
 from .skill_state import SkillSessionState
 from .tool_result_storage import ToolResultStorage
 from .cli_renderer import CliRenderer, Colors, _format_size
@@ -560,8 +561,8 @@ class Agent:
             )
 
         self.system_prompt = system_prompt
-        loader = next((getattr(tool, "skill_loader", None) for tool in self.tools.values()
-                       if getattr(tool, "skill_loader", None) is not None), None)
+        from .plugins.defaults import skill_loader_from_catalog
+        loader = skill_loader_from_catalog(self.tools)
         self.skill_runtime = skill_runtime or SkillRuntime(loader, session_log=session_log)
         self.skill_runtime.session_log = session_log
         for tool in self.tools.values():
@@ -584,6 +585,7 @@ class Agent:
         self.tools["goal_read"] = _GoalReadTool(self)
         self.tools["goal_write"] = _GoalWriteTool(self)
         self.session_log = session_log
+        self._pending_skill_restore: list[dict[str, Any]] = []
         if self.session_log is not None:
             projection = self.session_log.replay()
             self.messages.extend(projection.messages)
@@ -597,8 +599,15 @@ class Agent:
             if callable(configure_todos):
                 configure_todos(self.session_log, projection.todos)
             self.restored_skills = projection.skills
-            if self.restored_skills and self.skill_runtime.loader is not None:
-                self.skill_runtime.restore_records(self.restored_skills)
+            if self.restored_skills:
+                try:
+                    self.skill_runtime.restore_records(self.restored_skills)
+                except SkillDependencyError as exc:
+                    if exc.code != "SKILL_PROVIDER_UNAVAILABLE":
+                        raise
+                    # Legacy callers may supply current text through the
+                    # tuple restore API after construction, before execution.
+                    self._pending_skill_restore = self.restored_skills
         else:
             self.restored_skills = []
 
@@ -687,6 +696,7 @@ class Agent:
             {"name": name, "prompt": prompt, "sha256": historical_hash, "loadOrder": order}
             for name, prompt, historical_hash, order in skills
         ])
+        self._pending_skill_restore = []
 
     def active_skill_diagnostics(self) -> dict[str, object]:
         """Return metadata for effective references without exposing their bodies."""
@@ -925,6 +935,9 @@ class Agent:
         with host-specific services should pass ``AgentRunOptions`` instead of
         calling the low-level core loop.
         """
+        if self._pending_skill_restore:
+            self.skill_runtime.restore_records(self._pending_skill_restore)
+            self._pending_skill_restore = []
         self.skill_runtime.begin_turn()
         effective_options = options or self.default_run_options()
 

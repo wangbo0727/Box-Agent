@@ -25,5 +25,12 @@ class AgentService:
 
         return build_agent(agent_factory=self._agent_factory, **kwargs)
 
+    @staticmethod
+    def resolve_skill_loader(tools: list[Any]) -> Any:
+        """Use the same built-in reader binding as the public Agent constructor."""
+        from .plugins.defaults import skill_loader_from_catalog
+
+        return skill_loader_from_catalog({tool.name: tool for tool in tools})
+
 
 __all__ = ["AgentService"]

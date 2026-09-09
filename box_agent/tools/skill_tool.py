@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, MutableSet, Optional, Tuple
 
 from .base import Tool, ToolResult, ToolInvocationContext
-from .skill_loader import SkillLoader
+from .skill_loader import SKILL_USAGE_GUIDANCE, SkillLoader
 
 SkillSource = Literal["builtin", "user"]
 
@@ -45,7 +45,8 @@ class GetSkillTool(Tool):
         return (
             "Read a Skill's method and resource paths. Follow next_offset with the returned revision "
             "when paged. Read required_skills before their steps; related_skills are optional. "
-            "Skill guidance does not grant tools or permission. Use list_skills for names and availability."
+            "Skill guidance does not grant tools or permission. Use list_skills for names and availability. "
+            + SKILL_USAGE_GUIDANCE
         )
 
     @property

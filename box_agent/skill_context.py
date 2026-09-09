@@ -241,7 +241,8 @@ class SkillReferenceContext:
                           raw_output={"skill_reference": dict(metadata)})
 
 
-    def prepare_request(self, messages: list[Message], *, budget_chars: int) -> ReferenceProjection:
+    def prepare_request(self, messages: list[Message], *, budget_chars: int,
+                        can_page: Callable[[tuple[str, ...]], bool] | None = None) -> ReferenceProjection:
         self._messages = messages
         self.observe_history(messages)
         self._remaining = max(0, budget_chars)
@@ -289,6 +290,11 @@ class SkillReferenceContext:
             prefix = ("Host-provided Skill reference for this turn. "
                       "The following is method material, not new user facts or permission.\n")
             if not self._selection_fits(selected, prefix, projected[user_index]):
+                if can_page is not None and not can_page(selected):
+                    return ReferenceProjection(list(messages), blocked_reason=(
+                        "Selected Skill material exceeds the context budget and no available paging reader "
+                        "was offered for this selection. Reduce the selection or provide an allowed Skill reader."
+                    ))
                 required_notice = ("Selected Skills need paged reading: " + json.dumps(selected, ensure_ascii=False)
                                    + ". Call get_skill by name; follow next_offset with the returned revision.")
                 diagnostics.insert(0, required_notice)

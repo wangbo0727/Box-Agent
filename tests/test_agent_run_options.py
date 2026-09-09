@@ -394,11 +394,10 @@ async def test_agent_reports_reference_budget_without_truncating_source_and_can_
     assert "FIRST_REQUIRED_RULE" not in agent.system_prompt
     assert "SECOND_REQUIRED_RULE" not in agent.system_prompt
     agent.add_user_message("bounded input")
-    await agent.run()
-    assert "FIRST_REQUIRED_RULE" not in str(llm.requests)
-    assert "SECOND_REQUIRED_RULE" not in str(llm.requests)
-    assert "paged reading" in str(llm.requests[0][-1].content)
-    assert agent.messages[-2].content == "bounded input"
+    events = [event async for event in agent.run_events()]
+    assert llm.requests == []
+    assert any(isinstance(event, DoneEvent) and event.stop_reason == StopReason.ERROR for event in events)
+    assert agent.messages[-1].content == "bounded input"
 
     assert agent.deactivate_skill_instructions("first") is True
     assert "FIRST_REQUIRED_RULE" not in agent.system_prompt

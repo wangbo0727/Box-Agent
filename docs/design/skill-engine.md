@@ -1,6 +1,6 @@
 # Skill、Tool 与 Context：发现、读取与请求资料
 
-本 PR 将 Skill 统一为可发现、可按需读取的方法资料，并按职责分工：**Skill 管来源、选择与读取事实，Tool 管工具曝光、调用与权限，Context 管下一次模型输入中的正文位置、可见范围和预算，Kernel 管执行顺序与真实历史。** 目录提供名称、简介与可用性；正文通过真实 `get_skill` 结果或宿主选择后的普通资料块交付，不再因固定名称或关键词命中而自动写入 system。
+本 PR 将 Skill 统一为可发现、可按需读取的方法资料，并按职责分工：**Skill 管来源、选择与读取事实，Tool 管工具曝光、调用与权限，Context 管下一次模型输入中的正文位置、可见范围和预算，Kernel 管执行顺序与真实历史。** 目录名称和简介仍由 `SkillLoader.get_skills_metadata_prompt` 生成，经 CLI/ACP 现有 system 模板插入；Context 组装读取正文和宿主资料的位置、可见范围与预算。正文通过真实 `get_skill` 结果或宿主选择后的普通资料块交付，不再因固定名称或关键词命中而自动写入 system。
 
 本文说明当前源码的实现与兼容边界，不代表已发布或安装的运行时。测试入口列在文末；具体执行结果、目标提交和真实任务验证由本 PR 的最终验证报告分别记录。[Tool 重构文档](tool-refactor/design.md)保留其历史上下文，Skill 的当前行为以本文和源码为准。
 
@@ -21,6 +21,7 @@
 | 处理 | 放在哪里 | 这样分工的收益与代价 |
 | --- | --- | --- |
 | Skill 扫描、来源优先级、禁用和 required 校验、正文版本、选择与读取事实 | Skill Engine | 主任务和 child 共用来源规则；Context 读取前需要向 Skill 取得有效快照。若放入 Context，恢复与独立读取也会依赖模型请求。 |
+| 目录名称和简介的生成与插入 | SkillLoader 生成，CLI/ACP 现有 system 模板插入 | 保留发现入口，不等于读过正文；Context 接收包含这部分内容的完整消息并核算总量，不重新生成目录简介。 |
 | 正文进入哪个普通消息、当前真实文本覆盖、复用、整组选择与分页预算 | Context Engine 的 `SkillReferenceContext` | 每次按实际输入重新核算，压缩后不会误用“已读”状态；需要读取 Skill 快照并回报交付事实。若留在 Skill，Skill 就必须同时掌握消息和工具开销。 |
 | 工具目录、schema、曝光与调用目标、参数校验、权限和执行 | Tool Engine 与原权限入口 | 模型看到的工具与执行时解析的目标保持一致，每次执行仍检查权限；Context 接收完整工具集合。若 Context 自行删 schema 或重绑目标，会产生两套工具决定。 |
 | 已准备工具的 schema 开销、资料和临时消息的总输入开销 | Context Engine | 同一次请求统一分配资料预算；预算不足由正文分页或提示处理，不改变工具集合。 |
@@ -39,7 +40,7 @@ flowchart LR
 例如，用户选中了一个较长的 `review` Skill：
 
 1. Skill 提供当前有效正文，Tool Engine 准备本次可用工具。
-2. Context 核算完整请求后发现正文放不下，在当前 user 请求副本中放入名称与分页提示，保留工具定义。
+2. Context 发现正文放不下，且本次有允许读取该 Skill 的真实分页工具，便在当前 user 请求副本中放入名称与分页提示，保留工具定义。
 3. 模型实际调用 `get_skill` 后，Context 交付预算内的一页，Skill 记录交付事实，Kernel 写入真实调用和 tool 消息。
 4. 下一次请求仍由 Context 检查正文是否存在。若正文已被压缩移走，就提示重新读取，不因历史上“已读”而跳过。
 
@@ -47,7 +48,7 @@ flowchart LR
 
 ## 2. 先发现，再读取
 
-默认路径移除了固定 Skill 全文预加载，也移除了目录中按特殊名称写死的 always-on 特例。CLI、ACP 的匹配仍可更新目录简介，但匹配结果不加入显式选择集合，问候或普通主题匹配不会交付全文。
+默认路径移除了固定 Skill 全文预加载，也移除了目录中按特殊名称写死的 always-on 特例。CLI、ACP 仍通过 `SkillSelector` 匹配目录，并调用 `SkillLoader.get_skills_metadata_prompt` 生成有界的名称、简介等元数据，再插入既有 system 模板的 Skill 位置。这部分没有搬到 Context；目录字段作为发现数据处理，不是作者指令或权限。匹配结果不加入显式选择集合，问候或普通主题匹配不会交付全文。
 
 `list_skills(query="", offset=0, limit=20)` 查询完整本地目录，`limit` 上限为 50。它在完整目录中搜索后分页，不沿用自动推荐候选的 top16 截断。空查询可遍历有效目录；精确查询不可用名称时返回诊断。目录版本覆盖简介、来源、状态等元数据变化，正文变化本身不要求目录版本变化。调用方发现目录版本改变后应从第一页重新读取。
 
@@ -59,6 +60,8 @@ flowchart LR
 
 真实 `get_skill` 的正文保留在对应的 tool 消息中，`ToolResult.model_context` 明确提供模型应看到的有界正文或页面。它不再经由 `skill_result_adapter.py` 升为 system；不再使用的适配器已删除。通用结果存储不能把这份已经分配预算的 Skill 正文再次替换成短预览。
 
+采用 Skill 后，模型应在用户要求和现有权限范围内，遵循适用的方法步骤、必需参考文件与验证。必需步骤受阻时，应使用可用且获准的恢复方式，或明确报告未完成，不能把阻塞步骤改称可选。该通用规则由 `SKILL_USAGE_GUIDANCE` 同时进入目录提示和 `get_skill` 描述；Skill 作者正文仍留在普通资料中，不因此变成 system 指令或授予工具权限。
+
 用户显式选择由 `DefaultContextEngine.prepare_request` 调用 `SkillReferenceContext.prepare_request`，在当前 user 消息的**请求副本**中追加独立资料块。块中说明它是方法参考资料，不是新用户事实或权限。`Agent.messages` 中的原始用户文字及持久历史不因此改写，也不出现伪造的调用配对。
 
 当前轮选中的资料在该轮每一次模型请求中重新计算投影。同源同版本全文已经完整保留在真实 tool 历史中时复用该处，不重复追加正文。CLI、ACP 在新用户轮次更新选择；会话读取事实继续保留。旧公开 `activate_skill_instructions` API 仍可调用，含义改为注册普通宿主资料，`set_system_prompt` 不再承担 Skill 正文拼装。
@@ -69,7 +72,9 @@ Context 的预算面向下一次完整模型请求：包括已有消息、工具
 
 `reference_cost` 同时考虑字符数与 UTF-8 字节数，避免中文等多字节正文低估成本。资料页的外壳、元信息、短复用回执也计入预算。宿主资料使用 `projection_cost` 比较追加前后的最终 `Message`，计入正文转义、文本块包装及原字符串转为消息块的增量，不只计算原始资料文字。`PreparedContext.input_tokens` 记录请求资料的估算开销；内部 assistant 消息上的 `request_only_input_tokens` 让后续上下文估算扣回这部分非持久输入，避免下一页预算重复计数。
 
-宿主多选先检查整个资料包。若全部选中正文不能共同放入本次请求，**整组改为名称与读取提示，使用 `get_skill` 逐页读取**；不会先固定放入短 Skill，让长 Skill 的后续页持续没有空间。当前真实 tool 消息中已经完整可见的正文可参与复用，不重复占用宿主投影预算。若剩余预算连显式选择的分页提示都放不下，Context 返回 `PreparedContext.blocked_reason`，Kernel 在 provider 调用前发出 Error/Done 并结束该次 run，不静默丢掉用户选择。
+宿主多选先检查整个资料包。预算内的完整资料包可直接交付，即使本次没有读取工具。若全部选中正文不能共同放入请求，只有本次 `PreparedTools` 中存在真实、已曝光且可调用的 `GetSkillTool`，并且其允许范围和 profile 限制支持读取整组选中名称，才**整组改为名称与读取提示，使用 `get_skill` 逐页读取**。同名工具或仅有 schema 不足以证明分页能力；每次真实调用仍走权限检查。不会先固定放入短 Skill，让长 Skill 的后续页持续没有空间。
+
+当前真实 tool 消息中已经完整可见的正文可参与复用，不重复占用宿主投影预算。没有适用的分页 reader，或剩余预算连显式选择的分页提示都放不下时，Context 返回 `PreparedContext.blocked_reason`，Kernel 在 provider 调用前发出 Error/Done 并结束该次 run，不静默丢掉用户选择。
 
 分页以零起始行号定位，结果包含 `revision`、`offset`、`end_offset`、`total_lines`、`next_offset`、`has_more` 和 `complete`。页面保持完整行，`complete` 与已核实的可见范围共同计算。剩余预算连下一完整行都放不下时返回明确错误，不交付截断半行、不生成不前进的下一页位置。跨版本分页要求从新版本重新开始。
 
@@ -89,7 +94,9 @@ Agent 持有一个 `SkillRuntime`，每次 run 借用同一服务。共享 Loade
 
 原生快照保存实际交付的资料块。关闭诊断 trace 或原 Skill 文件随后被删除，仍可用 `read_skill_reference` 校验并重建当时的资料内容；这不表示已经删除或禁用的来源可以继续作为当前方法执行。Session Log 仍是唯一持久会话来源，CLI 没有因此新增一套持久会话产品。
 
-旧 `skill/change` 的 `name`、`sha256`、`loadOrder` 保持原含义，新来源、路径、原因、交付范围等字段只作增量扩展。Agent 在有 Loader 的构造恢复入口统一核对顺序、来源与版本，并采用**当前有效 Skill**。版本或来源与历史记录不同不阻断升级恢复，而是在普通资料中明确说明差异；新正文不得使用旧 hash 伪装成历史版本，原日志也不改写。只有当前来源缺失、禁用、损坏或 required 依赖校验失败才阻断恢复，失败不覆盖已有有效状态。旧 tuple 恢复 API 仍支持，恢复本身不制造新的工具加载事件。新日志继续使用旧读者认识的事件类型。
+旧 `skill/change` 的 `name`、`sha256`、`loadOrder` 保持原含义，新来源、路径、原因、交付范围等字段只作增量扩展。Agent 在有 Loader 的构造恢复入口统一核对顺序、来源与版本，并采用**当前有效 Skill**。版本或来源与历史记录不同不阻断升级恢复，而是在普通资料中明确说明差异；新正文不得使用旧 hash 伪装成历史版本，原日志也不改写。只有当前来源缺失、禁用、损坏或 required 依赖校验失败才阻断恢复，失败不覆盖已有有效状态。恢复本身不制造新的工具加载事件。新日志继续使用旧读者认识的事件类型。
+
+若历史中有 Skill 记录而当前没有来源，Agent 构造时暂存待恢复记录，允许调用方随后通过旧 `restore_active_skill_instructions` tuple API 提供当前正文。若执行开始时仍无法恢复，`run_events` 在模型调用和本次日志写入之前阻断，不能丢弃历史 Skill 后继续。ACP 没有这一步后补 tuple 的入口，因此在 `SessionLog.prepare_resume` 修复日志之前先校验来源；未单独传入会话 Loader 时，回退到真实 Get/List 工具的 Loader，校验失败不改写原日志。
 
 恢复有效资料后，首轮普通参考资料或有界再读提示让模型重新找到当前方法；版本变化不会被当成损坏会话。对于旧 system 中的 active Skill 后缀，只在它与已核实旧记录正文构成的后缀逐字一致时，从**请求投影**中移除；不会按标题猜测和删除任意调用方 system 内容，原持久消息也不被重写。这保留 `main` 在 `8702f84` 引入的升级恢复行为，不恢复“历史 hash 不同即拒绝会话”的旧策略。
 
@@ -105,7 +112,7 @@ Agent 持有一个 `SkillRuntime`，每次 run 借用同一服务。共享 Loade
 
 外层 composition 经现有静态插件注册表提供 `SkillEnginePort`、`ContextEnginePort` 和 Store。默认 `DefaultContextEngine` 使用现有 plugin factory 按 run 创建；插件替换完成、最终工具目录与 Skill 来源校验通过后，才以 `configure_run` 借用最终 Skill Engine 和 Store。Kernel 接收 `PreparedContextPort` 描述的请求消息、资料关联、开销与阻断原因，不导入 `SkillRuntime`、Loader 或正文解析实现。
 
-默认来源推断只识别真实 Get/List；内置工具的 Loader 与 Skill 服务的 Loader 不一致时，外层装配明确拒绝。插件替换来源应成对替换工具目录和 Skill reader，不能悄悄搬迁已有会话事实。后续真实 `get_skill` 通过 Context 提供的 `tool_reader` 读取有界正文，调用与权限仍经过原 Tool Engine。
+Agent、默认装配和 ACP 的来源回退共用 `skill_loader_from_catalog`，只从真实 `GetSkillTool` / `ListSkillsTool` 实例推断来源；其他工具即使带有 `skill_loader` 属性，也不会成为 Skill 来源。内置工具的 Loader 与 Skill 服务的 Loader 不一致时，外层装配明确拒绝。插件替换来源应成对替换工具目录和 Skill reader，不能悄悄搬迁已有会话事实。后续真实 `get_skill` 通过 Context 提供的 `tool_reader` 读取有界正文，调用与权限仍经过原 Tool Engine。
 
 这里选择**集中连接依赖，各模块处理自己的业务**。若由 Skill、Tool 或 Kernel 在内部各自创建 Context，局部代码容易直接调用，但插件替换后的 Skill/Store 可能与 Context 持有的实例不同，预算与状态也容易重复。集中装配把创建、替换和来源核对放在一次启动流程中，能保证 Context 借用最终实例；代价是装配层要明确传递依赖并测试替换关系。现有 PluginHost 已支持这一流程，因此无需新增注册系统，也不把 Skill 或 Tool 的全部处理搬进 Context。
 
@@ -117,10 +124,10 @@ Tool 默认引擎的创建、注册与释放装配是独立后续工作，不承
 
 | 边界 | 主要源码 | 现有测试文件 |
 | --- | --- | --- |
-| 本地发现、来源刷新、禁用与分页目录 | `tools/skill_loader.py`、`tools/skill_catalog_tool.py` | `tests/test_skill_loader.py`、`test_skill_filter.py`、`test_skill_catalog_tool.py` |
+| 本地发现、来源刷新、禁用、目录提示与通用使用规则 | `tools/skill_loader.py`、`tools/skill_catalog_tool.py`、`tools/skill_tool.py` | `tests/test_skill_loader.py`、`test_skill_filter.py`、`test_skill_catalog_tool.py`、`test_skill_usage_guidance.py` |
 | Skill 来源快照、选择与已交付事实 | `skill_runtime.py`、`skill_state.py`、`tools/skill_tool.py` | `tests/test_skill_tool.py`、`test_context_input.py`、`test_skill_context_regressions.py` |
-| Context 请求装配、真实读取覆盖、资料预算与分页 | `context_input.py`、`skill_context.py`、`kernel/context_engine.py` | `tests/test_context_input.py`、`test_skill_context.py`、`test_skill_context_regressions.py`、`test_tool_result_storage.py` |
-| Agent 借用、公开兼容 API 与恢复 | `agent.py`、`session_log.py` | `tests/test_agent_run_options.py`、`test_agent_session_persistence.py`、`test_skill_reference_persistence.py` |
+| Context 请求装配、真实读取覆盖、资料预算与分页能力 | `context_input.py`、`skill_context.py`、`kernel/context_engine.py` | `tests/test_context_input.py`、`test_skill_context.py`、`test_skill_context_regressions.py`、`test_skill_entry_boundaries.py`、`test_tool_result_storage.py` |
+| Agent 借用、真实工具来源、公开兼容 API 与恢复 | `agent.py`、`agent_service.py`、`session_log.py`、`acp/__init__.py` | `tests/test_agent_run_options.py`、`test_agent_session_persistence.py`、`test_skill_entry_boundaries.py`、`test_skill_reference_persistence.py` |
 | CLI/ACP 选择、profile、预算与用量归因 | `cli.py`、`acp/__init__.py`、`tools/local_tool_exposure.py` | `tests/test_skill_preload.py`、`test_skill_prompt_layout.py`、`test_acp.py`、`test_local_tool_search.py` |
 | required 闭包、child 正文角色和能力限制 | `skill_dependencies.py`、`tools/sub_agent_capabilities.py`、`tools/sub_agent_tool.py` | `tests/test_sub_agent_capabilities.py`、`test_sub_agent_tool.py` |
 | 默认来源与 Context 依赖绑定、Port 与插件替换 | `composition.py`、`plugins/defaults.py`、`kernel/ports.py` | `tests/test_skill_plugin_composition.py`、`test_plugin_host.py`、`test_context_input.py`、`test_architecture_boundaries.py` |

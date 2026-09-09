@@ -89,9 +89,10 @@ def test_host_projection_charges_serialized_blocks_and_original_user_escaping(ru
     engine = DefaultContextEngine()
     engine.configure_run(skill_engine=runtime)
     messages = [Message(role="user", content='"\\' * 250)]
-    request = engine.prepare_request(messages, prepared_tools=prepare_tools([]), token_limit=4000)
+    tool = GetSkillTool(runtime.loader)
+    request = engine.prepare_request(messages, prepared_tools=prepare_tools([tool]), token_limit=4000)
 
-    assert _fallback_context_estimate(request.messages, {}) + 1024 <= 4000
+    assert _fallback_context_estimate(request.messages, {tool.name: tool}) + 1024 <= 4000
     assert "get_skill" in str(request.messages) or "[Skill reference]" in str(request.messages)
 
 

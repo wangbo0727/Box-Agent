@@ -62,6 +62,19 @@ class DefaultContextEngine:
         """Reserve already accepted request-only material during a serial batch."""
         self._pending_followup_blocks.extend(blocks)
 
+    def _can_page(self, names: tuple[str, ...]) -> bool:
+        from .tools.skill_tool import GetSkillTool
+
+        assert self.prepared_tools is not None
+        for name, target in self.prepared_tools.targets.items():
+            if not isinstance(target, GetSkillTool) or self.prepared_tools.validate_call(name) is not None:
+                continue
+            allowed = target.allowed_skill_names
+            blocked = target.blocked_skill_names - (target.explicitly_allowed_skill_names or set())
+            if (allowed is None or set(names) <= allowed) and not blocked.intersection(names):
+                return True
+        return False
+
     def _read_reference(self, name: str, **arguments: Any) -> ToolResult:
         assert self.references is not None
         self.references.bind_history([*self._history, *self._extra_messages])
@@ -106,6 +119,7 @@ class DefaultContextEngine:
                             if transient_message is not None else context_messages)
             projection = self.references.prepare_request(
                 context_messages,
+                can_page=self._can_page,
                 budget_chars=skill_reference_budget_chars(
                     full_request, prepared_tools.definitions, token_limit, output_tokens,
                 ),

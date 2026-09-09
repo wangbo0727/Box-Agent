@@ -1902,6 +1902,15 @@ class BoxACPAgent:
                     cwd=workspace,
                 )
             else:
+                try:
+                    # Validate current Skill sources before resume repair can
+                    # append records. ACP has no later host-tuple restore step.
+                    restore_loader = (session_skill_loader if session_skill_loader is not None
+                                      else AgentService.resolve_skill_loader(tools))
+                    SkillRuntime(restore_loader).restore_records(session_log.replay().skills)
+                except Exception:
+                    session_log.close()
+                    raise
                 session_log.prepare_resume()
                 session_log_restored = True
 
