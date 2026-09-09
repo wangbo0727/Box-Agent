@@ -54,7 +54,6 @@ from .tools.mcp_tool_search import (
 )
 from .skill_runtime import SkillRuntime
 from .skill_dependencies import SkillDependencyError
-from .skill_state import SkillSessionState
 from .tool_result_storage import ToolResultStorage
 from .cli_renderer import CliRenderer, Colors, _format_size
 from .session_continuation import ContinuationMessage
@@ -586,6 +585,7 @@ class Agent:
         self.tools["goal_write"] = _GoalWriteTool(self)
         self.session_log = session_log
         self._pending_skill_restore: list[dict[str, Any]] = []
+        self._skill_persistence_pending = False
         if self.session_log is not None:
             projection = self.session_log.replay()
             self.messages.extend(projection.messages)
@@ -671,24 +671,40 @@ class Agent:
     def activate_skill_instructions(self, skill_name: str, skill_prompt: str) -> None:
         """Deprecated host API: select ordinary reference material for this turn."""
         if skill_name.strip() and skill_prompt.strip():
-            self.skill_runtime.register_reference(skill_name.strip(), skill_prompt)
+            name = skill_name.strip()
+            previous_sequence = self.skill_runtime.state.sequence
+            replaces_pending = any(row["name"] == name for row in self._pending_skill_restore)
+            order = max([previous_sequence, *(row["loadOrder"] for row in self._pending_skill_restore)]) + 1
+            self.skill_runtime.register_reference(name, skill_prompt, order=order, persist=False)
+            self._pending_skill_restore = [row for row in self._pending_skill_restore if row["name"] != name]
+            if (replaces_pending or self.skill_runtime.state.sequence != previous_sequence
+                    or self._skill_persistence_pending):
+                self._persist_active_skills()
 
     def deactivate_skill_instructions(self, skill_name: str) -> bool:
         name = skill_name.strip()
-        removed = self.skill_runtime.state.reads.pop(name, None) is not None
-        self.skill_runtime.select([item for item in self.skill_runtime.state.selected if item != name])
-        if removed:
+        pending = any(row["name"] == name for row in self._pending_skill_restore)
+        removed = self.skill_runtime.deactivate_reference(name) or pending
+        self._pending_skill_restore = [row for row in self._pending_skill_restore if row["name"] != name]
+        if removed or self._skill_persistence_pending:
             self._persist_active_skills()
         return removed
 
     def clear_active_skill_instructions(self) -> None:
-        self.skill_runtime.state = SkillSessionState()
+        self.skill_runtime.clear_references()
+        self._pending_skill_restore = []
         self._persist_active_skills()
 
     def _persist_active_skills(self) -> None:
         if self.session_log is not None:
-            self.session_log.append("skill/change", {"skills": self.skill_runtime.log_records()})
+            self._skill_persistence_pending = True
+            records = {row["name"]: row for row in self._pending_skill_restore}
+            records.update((row["name"], row) for row in self.skill_runtime.log_records())
+            self.session_log.append("skill/change", {
+                "skills": sorted(records.values(), key=lambda row: row["loadOrder"]),
+            })
             self.session_log.flush()
+            self._skill_persistence_pending = False
 
     def restore_active_skill_instructions(self, skills: list[tuple[str, str, str, int]]) -> None:
         """Restore current valid references; historical hashes remain provenance."""
@@ -935,6 +951,8 @@ class Agent:
         with host-specific services should pass ``AgentRunOptions`` instead of
         calling the low-level core loop.
         """
+        if self._skill_persistence_pending:
+            self._persist_active_skills()
         if self._pending_skill_restore:
             self.skill_runtime.restore_records(self._pending_skill_restore)
             self._pending_skill_restore = []

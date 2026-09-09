@@ -96,6 +96,7 @@ class ReferenceProjection:
     diagnostics: tuple[str, ...] = ()
     input_tokens: int = 0
     blocked_reason: str | None = None
+    on_committed: Callable[[], None] | None = None
 
 
 class SkillReferenceContext:
@@ -242,7 +243,8 @@ class SkillReferenceContext:
 
 
     def prepare_request(self, messages: list[Message], *, budget_chars: int,
-                        can_page: Callable[[tuple[str, ...]], bool] | None = None) -> ReferenceProjection:
+                        can_page: Callable[[tuple[str, ...]], bool] | None = None,
+                        defer_delivery: bool = False) -> ReferenceProjection:
         self._messages = messages
         self.observe_history(messages)
         self._remaining = max(0, budget_chars)
@@ -351,7 +353,17 @@ class SkillReferenceContext:
                                        blocked_reason=blocked_reason)
         for ref, text in staged_snapshots:
             ref.update(self._store_reference(text))
-        for snapshot, metadata, reason in staged_deliveries:
-            self.runtime.record_delivery(snapshot, metadata, reason=reason)
+        delivered_count = 0
+
+        def commit_deliveries() -> None:
+            nonlocal delivered_count
+            while delivered_count < len(staged_deliveries):
+                snapshot, metadata, reason = staged_deliveries[delivered_count]
+                self.runtime.record_delivery(snapshot, metadata, reason=reason)
+                delivered_count += 1
+
+        if not defer_delivery:
+            commit_deliveries()
         return ReferenceProjection(projected, tuple(references), tuple(diagnostics),
-                            (self.reference_overhead_chars + 3) // 4, blocked_reason)
+                            (self.reference_overhead_chars + 3) // 4, blocked_reason,
+                            commit_deliveries if defer_delivery and staged_deliveries else None)

@@ -1286,6 +1286,7 @@ async def _run_agent_loop_impl(
         ]
         request_overlay_tokens = pending_transient_followup_tokens if transient_message is not None else 0
         skill_references = ()
+        on_request_committed = None
         if context_engine is not None:
             output_budget = getattr(llm, "max_output_tokens", 0)
             projection = context_engine.prepare_request(
@@ -1307,6 +1308,7 @@ async def _run_agent_loop_impl(
             provider_request_messages = projection.messages
             skill_references = projection.references
             request_overlay_tokens = projection.request_only_input_tokens
+            on_request_committed = getattr(projection, "on_committed", None)
         else:
             # Legacy manually constructed service bundles may omit Context.
             request_messages = [*messages, *request_context_messages]
@@ -1369,6 +1371,8 @@ async def _run_agent_loop_impl(
             )
             session_log.flush()
 
+        if callable(on_request_committed):
+            on_request_committed()
 
         cache_fingerprint = build_cache_fingerprint(
             messages=request_messages,

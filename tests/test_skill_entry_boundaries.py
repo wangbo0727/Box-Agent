@@ -19,16 +19,17 @@ class CapturingProvider:
     model = "offline-test"
     max_output_tokens = 1024
 
-    def __init__(self, request_skill=None):
+    def __init__(self, request_skill=None, skill_read_limit=10):
         self.requests = []
         self.request_skill = request_skill
+        self.skill_read_limit = skill_read_limit
 
     async def generate_stream(self, messages, tools=None, **kwargs):
         self.requests.append([message.model_copy(deep=True) for message in messages])
         if self.request_skill and len(self.requests) == 1:
             yield StreamEvent(type="finish", finish_reason="tool", tool_calls=[ToolCall(
                 id="read-selected", type="function", function=FunctionCall(
-                    name="get_skill", arguments={"skill_name": self.request_skill, "limit": 10}))])
+                    name="get_skill", arguments={"skill_name": self.request_skill, "limit": self.skill_read_limit}))])
             return
         yield StreamEvent(type="text", delta="done")
         yield StreamEvent(type="finish", finish_reason="stop")
@@ -182,3 +183,216 @@ async def test_explicit_material_needs_body_or_an_offered_paging_reader(tmp_path
             assert result.tool_call_id == "read-selected"
             assert "FIRST" in result.content and '"has_more": true' in result.content
     assert ("get_skill" in agent.tools) == with_reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_loader", [False, True])
+@pytest.mark.parametrize("operation", ["clear", "deactivate"])
+async def test_explicit_removal_cancels_restoration_before_first_request(tmp_path, with_loader, operation):
+    seed_log(tmp_path / "sessions", tmp_path)
+    log = SessionLog.open(tmp_path / "sessions", session_id="restore-skill", cwd=tmp_path)
+    provider = CapturingProvider()
+    tools = [GetSkillTool(loader_at(tmp_path / "skills"))] if with_loader else []
+    try:
+        agent = Agent(llm_client=provider, system_prompt="BASE", tools=tools, session_log=log,
+                      workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, max_steps=1)
+        if operation == "clear":
+            agent.clear_active_skill_instructions()
+        else:
+            assert agent.deactivate_skill_instructions("demo") is True
+            assert agent.deactivate_skill_instructions("demo") is False
+        assert log.replay().skills == []
+        for _ in range(2):
+            agent.add_user_message("continue without the removed method")
+            _ = [event async for event in agent.run_events()]
+        assert len(provider.requests) == 2
+        assert "METHOD_BODY" not in str(provider.requests)
+        assert "No Skill source" not in str(provider.requests)
+        assert log.replay().skills == []
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_removing_one_unresolved_skill_keeps_other_pending_records(tmp_path):
+    log = SessionLog.create(tmp_path / "sessions", session_id="two-methods", cwd=tmp_path)
+    rows = [{"name": name, "sha256": sha256(name.encode()).hexdigest(), "loadOrder": order}
+            for order, name in enumerate(("first", "second"), 1)]
+    log.append("skill/change", {"skills": rows})
+    log.flush()
+    provider = CapturingProvider()
+    try:
+        agent = Agent(llm_client=provider, system_prompt="BASE", tools=[], session_log=log,
+                      workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, max_steps=1)
+        assert agent.deactivate_skill_instructions("first") is True
+        assert log.replay().skills == [rows[1]]
+        agent.add_user_message("continue")
+        with pytest.raises(SkillDependencyError, match="No Skill source"):
+            _ = [event async for event in agent.run_events()]
+        assert provider.requests == []
+        assert agent.deactivate_skill_instructions("second") is True
+        _ = [event async for event in agent.run_events()]
+        assert len(provider.requests) == 1
+        assert log.replay().skills == []
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_registering_current_host_methods_preserves_other_pending_log_records(tmp_path):
+    log = SessionLog.create(tmp_path / "sessions", session_id="replace-methods", cwd=tmp_path)
+    rows = [{"name": name, "sha256": sha256(name.encode()).hexdigest(), "loadOrder": order}
+            for order, name in enumerate(("first", "second"), 1)]
+    log.append("skill/change", {"skills": rows})
+    log.flush()
+    provider = CapturingProvider()
+    try:
+        agent = Agent(llm_client=provider, system_prompt="BASE", tools=[], session_log=log,
+                      workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, max_steps=1)
+        agent.activate_skill_instructions("first", "REPLACEMENT_FIRST")
+        agent.activate_skill_instructions("new-method", "NEW_METHOD")
+        records = log.replay().skills
+        assert [row["name"] for row in records] == ["second", "first", "new-method"]
+        assert records[0] == rows[1]
+        assert [row["loadOrder"] for row in records] == [2, 3, 4]
+        before = log.path.read_bytes()
+        agent.activate_skill_instructions("new-method", "NEW_METHOD")
+        assert log.path.read_bytes() == before
+        agent.add_user_message("continue with the registered current methods")
+        with pytest.raises(SkillDependencyError, match="No Skill source"):
+            _ = [event async for event in agent.run_events()]
+        assert provider.requests == []
+        assert agent.deactivate_skill_instructions("second") is True
+        _ = [event async for event in agent.run_events()]
+        assert len(provider.requests) == 1
+        assert "REPLACEMENT_FIRST" in str(provider.requests)
+        assert "NEW_METHOD" in str(provider.requests)
+        assert [row["name"] for row in log.replay().skills] == ["first", "new-method"]
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_clearing_restored_references_still_strips_verified_legacy_system_suffix(tmp_path):
+    from box_agent.tools.skill_preload import build_active_skills_prompt
+
+    provider = CapturingProvider()
+    agent = Agent(llm_client=provider, system_prompt="BASE", tools=[], workspace_dir=str(tmp_path),
+                  deferred_mcp_loading_enabled=False, max_steps=1)
+    body = "LEGACY_METHOD_MUST_NOT_REAPPEAR"
+    agent.restore_active_skill_instructions([("demo", body, sha256(body.encode()).hexdigest(), 1)])
+    old_system = build_active_skills_prompt("BASE", {"demo": body})
+    agent.set_system_prompt(old_system)
+    agent.clear_active_skill_instructions()
+    agent.add_user_message("continue without the removed method")
+    _ = [event async for event in agent.run_events()]
+    assert len(provider.requests) == 1
+    assert provider.requests[0][0].content == "BASE"
+    assert body not in str(provider.requests)
+    assert agent.messages[0].content == old_system
+
+
+@pytest.mark.asyncio
+async def test_failed_restoration_stays_required_across_runs_until_reader_is_available(tmp_path):
+    from box_agent.skill_runtime import SkillRuntime
+
+    loader = loader_at(tmp_path / "skills")
+    path = tmp_path / "skills" / "demo" / "SKILL.md"
+    path.write_text("---\nname: demo\ndescription: example\n---\nMETHOD_BODY\n" + ("x" * 79 + "\n") * 500)
+    provider = CapturingProvider(request_skill="demo", skill_read_limit=20)
+    agent = Agent(llm_client=provider, system_prompt="BASE", tools=[], skill_runtime=SkillRuntime(loader),
+                  workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, token_limit=5000, max_steps=3)
+    agent.restore_active_skill_instructions([("demo", "old text", sha256(b"old text").hexdigest(), 1)])
+    for _ in range(2):
+        agent.add_user_message("continue using the restored method")
+        events = [event async for event in agent.run_events()]
+        assert any(isinstance(event, ErrorEvent) and "reader" in event.message.lower() for event in events)
+        assert provider.requests == []
+        assert agent.skill_runtime.turn_deliveries == {}
+    agent.tools["get_skill"] = GetSkillTool(loader)
+    agent.add_user_message("continue with the now available reader")
+    _ = [event async for event in agent.run_events()]
+    assert len(provider.requests) == 2
+    assert "paged" in str(provider.requests[0])
+    result = next(message for message in provider.requests[1] if message.role == "tool")
+    assert result.tool_call_id == "read-selected"
+    assert "METHOD_BODY" in result.content
+
+
+class RecoverableSkillStore:
+    """A plugin store that rejects one Skill write, then accepts retries."""
+
+    def __init__(self, log, failure):
+        self.log, self.failure, self.armed, self.pending_flush = log, failure, True, False
+
+    def __getattr__(self, name):
+        return getattr(self.log, name)
+
+    def append(self, kind, payload, **kwargs):
+        if kind == "skill/change" and self.armed:
+            self.armed = False
+            if self.failure == "append":
+                raise OSError("retryable Skill append failure")
+            self.pending_flush = True
+        return self.log.append(kind, payload, **kwargs)
+
+    def flush(self):
+        if self.pending_flush:
+            self.pending_flush = False
+            raise OSError("retryable Skill flush failure")
+        return self.log.flush()
+
+
+@pytest.mark.parametrize("operation", ["activate", "deactivate", "clear"])
+@pytest.mark.parametrize("failure", ["append", "flush"])
+def test_public_skill_change_retries_persistence_even_after_in_memory_change(tmp_path, operation, failure):
+    seed_log(tmp_path / "sessions", tmp_path)
+    log = SessionLog.open(tmp_path / "sessions", session_id="restore-skill", cwd=tmp_path)
+    store = RecoverableSkillStore(log, failure)
+    try:
+        agent = Agent(llm_client=CapturingProvider(), system_prompt="BASE", tools=[], session_log=store,
+                      workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, max_steps=1)
+        actions = {
+            "activate": lambda: agent.activate_skill_instructions("demo", "CURRENT_METHOD"),
+            "deactivate": lambda: agent.deactivate_skill_instructions("demo"),
+            "clear": agent.clear_active_skill_instructions,
+        }
+        with pytest.raises(OSError, match="retryable Skill"):
+            actions[operation]()
+        actions[operation]()
+        log.flush()
+        records = log.replay().skills
+        if operation == "activate":
+            assert records[0]["sha256"] == sha256(b"CURRENT_METHOD").hexdigest()
+        else:
+            assert records == []
+        before = log.path.read_bytes()
+        if operation != "clear":
+            actions[operation]()
+            assert log.path.read_bytes() == before
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_next_run_retries_pending_skill_write_before_requesting_model(tmp_path):
+    seed_log(tmp_path / "sessions", tmp_path)
+    log = SessionLog.open(tmp_path / "sessions", session_id="restore-skill", cwd=tmp_path)
+    store = RecoverableSkillStore(log, "append")
+    provider = CapturingProvider()
+    try:
+        agent = Agent(llm_client=provider, system_prompt="BASE", tools=[], session_log=store,
+                      workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, max_steps=1)
+        with pytest.raises(OSError, match="retryable Skill"):
+            agent.clear_active_skill_instructions()
+        agent.add_user_message("continue without any restored method")
+        store.armed = True
+        with pytest.raises(OSError, match="retryable Skill"):
+            _ = [event async for event in agent.run_events()]
+        assert provider.requests == []
+        _ = [event async for event in agent.run_events()]
+        assert len(provider.requests) == 1
+        assert "METHOD_BODY" not in str(provider.requests)
+        assert log.replay().skills == []
+    finally:
+        log.close()

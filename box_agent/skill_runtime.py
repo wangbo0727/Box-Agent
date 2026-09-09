@@ -33,10 +33,32 @@ class SkillRuntime:
 
     def begin_turn(self) -> None:
         self.turn_deliveries.clear()
-        self._restoring, self._restore_pending = self._restore_pending, ()
+        # A rejected request has not delivered its restored methods. Retain
+        # them across retries until a complete read or explicit removal.
+        self._restoring = self._restore_pending
 
     def select(self, names: list[str] | tuple[str, ...]) -> None:
         self.state.selected = tuple(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+    def deactivate_reference(self, name: str) -> bool:
+        """Withdraw an active or pending host reference without editing history."""
+        removed = name in (*self.state.reads, *self.state.selected,
+                           *self._restore_pending, *self._restoring)
+        self.state.reads.pop(name, None)
+        self.select([item for item in self.state.selected if item != name])
+        self._restore_pending = tuple(item for item in self._restore_pending if item != name)
+        self._restoring = tuple(item for item in self._restoring if item != name)
+        self._restore_diagnostics.pop(name, None)
+        self.turn_deliveries.pop(name, None)
+        return removed
+
+    def clear_references(self) -> None:
+        self.state = SkillSessionState()
+        self._restore_pending = self._restoring = ()
+        self._restore_diagnostics.clear()
+        self.turn_deliveries.clear()
+        # Keep the verified legacy suffix as evidence for request-only
+        # stripping; forgetting it could expose old author text as system.
 
     @property
     def active_names(self) -> tuple[str, ...]:
@@ -207,6 +229,8 @@ class SkillRuntime:
         if reason != "restored" and not metadata.get("reused"):
             self._remember(snapshot, snapshot.prompt, reason, metadata)
         self.turn_deliveries[snapshot.name] = dict(metadata)
+        if metadata.get("complete"):
+            self._restore_pending = tuple(name for name in self._restore_pending if name != snapshot.name)
 
     def record_observation(self, snapshot: SkillReferenceSnapshot, metadata: dict[str, Any]) -> None:
         """Recover validated historical delivery facts without rewriting logs."""

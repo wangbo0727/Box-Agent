@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .kernel.context_engine import _fallback_context_estimate, skill_reference_budget_chars
 from .schema import Message
@@ -22,6 +22,7 @@ class PreparedContext:
     input_tokens: int = 0
     request_only_input_tokens: int = 0
     blocked_reason: str | None = None
+    on_committed: Callable[[], None] | None = None
 
 
 class DefaultContextEngine:
@@ -114,21 +115,25 @@ class DefaultContextEngine:
         references: tuple[dict[str, Any], ...] = ()
         self._request_reference_tokens = 0
         blocked_reason = None
+        on_committed = None
         if self.references is not None:
             full_request = ([*context_messages, transient_message]
                             if transient_message is not None else context_messages)
             projection = self.references.prepare_request(
                 context_messages,
                 can_page=self._can_page,
+                defer_delivery=True,
                 budget_chars=skill_reference_budget_chars(
                     full_request, prepared_tools.definitions, token_limit, output_tokens,
                 ),
             )
             context_messages, references = projection.messages, projection.references
             blocked_reason = projection.blocked_reason
+            on_committed = projection.on_committed
             self._request_reference_tokens = projection.input_tokens
         provider_messages = ([*context_messages, transient_message]
                              if transient_message is not None else context_messages)
         return PreparedContext(provider_messages, context_messages, references,
                                self._request_reference_tokens,
-                               self._request_reference_tokens + self._transient_tokens, blocked_reason)
+                               self._request_reference_tokens + self._transient_tokens, blocked_reason,
+                               on_committed)

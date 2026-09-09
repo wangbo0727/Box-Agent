@@ -88,9 +88,11 @@ Agent 持有一个 `SkillRuntime`，每次 run 借用同一服务。共享 Loade
 
 ## 6. 持久化与恢复兼容
 
-原生 `SessionLog` 下，Context 将成功交付的宿主正文资料块交给 `store_skill_reference`，按内容 SHA-256 存入当前 session 的 `skill-references/`，返回 `contentRef`、hash、名称、版本、消息位置和范围。Kernel 将这些信息关联到既有 `request/context.skillReferences`，flush 完成后才调用 provider。重复内容复用快照；损坏、路径逃逸、符号链接及写入/fsync 失败均不能返回持久化成功。
+原生 `SessionLog` 下，Context 将准备放入请求的宿主正文资料块交给 `store_skill_reference`，按内容 SHA-256 存入当前 session 的 `skill-references/`，返回 `contentRef`、hash、名称、版本、消息位置和范围。Kernel 将这些信息关联到既有 `request/context.skillReferences`，flush 完成后，才确认本次资料交付并调用 provider。准备好正文或写好快照本身不等于请求已提交；任一步失败都不能提前消耗待恢复资料。重复内容复用快照；损坏、路径逃逸、符号链接及写入/fsync 失败均不能返回持久化成功。
 
 `SessionStorePort` 不新增快照文件接口。第三方 Store 没有 `store_skill_reference` 时，Context 返回预算内的 `inlineContent` 和 `sha256`，由 Kernel 写入同一个既有 `request/context` 记录并 flush。这样保留实际交付内容，又不要求插件实现原生文件布局；代价是该条请求记录包含正文。两条路径都不新增事件类型，也不增加会话状态来源。
+
+这一步确认使用 `PreparedContext.on_committed` 可选回调：Kernel 只在请求持久化成功后调用，不解析 Skill 业务。没有 Store 时在同一执行位置确认；旧第三方 Context 返回值不提供此回调也可继续工作。默认 Context 延迟回报交付，回调按已成功记录的项目推进，重复调用不会重复确认，失败项可重试。单独使用 `SkillReferenceContext.prepare_request` 的旧调用方仍默认立即回报。
 
 原生快照保存实际交付的资料块。关闭诊断 trace 或原 Skill 文件随后被删除，仍可用 `read_skill_reference` 校验并重建当时的资料内容；这不表示已经删除或禁用的来源可以继续作为当前方法执行。Session Log 仍是唯一持久会话来源，CLI 没有因此新增一套持久会话产品。
 
@@ -99,6 +101,10 @@ Agent 持有一个 `SkillRuntime`，每次 run 借用同一服务。共享 Loade
 若历史中有 Skill 记录而当前没有来源，Agent 构造时暂存待恢复记录，允许调用方随后通过旧 `restore_active_skill_instructions` tuple API 提供当前正文。若执行开始时仍无法恢复，`run_events` 在模型调用和本次日志写入之前阻断，不能丢弃历史 Skill 后继续。ACP 没有这一步后补 tuple 的入口，因此在 `SessionLog.prepare_resume` 修复日志之前先校验来源；未单独传入会话 Loader 时，回退到真实 Get/List 工具的 Loader，校验失败不改写原日志。
 
 恢复有效资料后，首轮普通参考资料或有界再读提示让模型重新找到当前方法；版本变化不会被当成损坏会话。对于旧 system 中的 active Skill 后缀，只在它与已核实旧记录正文构成的后缀逐字一致时，从**请求投影**中移除；不会按标题猜测和删除任意调用方 system 内容，原持久消息也不被重写。这保留 `main` 在 `8702f84` 引入的升级恢复行为，不恢复“历史 hash 不同即拒绝会话”的旧策略。
+
+恢复后若因预算不足、没有分页工具或请求写入失败而未能交付，下一次执行仍须处理同一份待恢复资料，不能因上次已开始运行就跳过。只有完整正文已确认交付，或调用方明确撤销、清空该方法，才移除其待恢复状态。公开 `deactivate_skill_instructions`、`clear_active_skill_instructions` 同步清理已载入和待恢复的选择；新增或替换一个方法保留其他尚未恢复的日志记录及顺序。清空选择仍保留已经核实的旧 system 后缀证据，用于阻止旧正文重新进入 system，不删除真实历史。
+
+公开选择变更写入失败时，Agent 保留未提交标记；重复该操作或开始下一次运行时先重试写入，成功后才继续执行。这里允许的是第三方 Store 明确可恢复的临时失败；原生 Session Log 的底层 I/O 失败仍保持失败状态，不会被 Agent 绕过。Session Log 继续是唯一持久状态来源。
 
 ## 7. 子 Agent 的明确委派
 
@@ -126,7 +132,7 @@ Tool 默认引擎的创建、注册与释放装配是独立后续工作，不承
 | --- | --- | --- |
 | 本地发现、来源刷新、禁用、目录提示与通用使用规则 | `tools/skill_loader.py`、`tools/skill_catalog_tool.py`、`tools/skill_tool.py` | `tests/test_skill_loader.py`、`test_skill_filter.py`、`test_skill_catalog_tool.py`、`test_skill_usage_guidance.py` |
 | Skill 来源快照、选择与已交付事实 | `skill_runtime.py`、`skill_state.py`、`tools/skill_tool.py` | `tests/test_skill_tool.py`、`test_context_input.py`、`test_skill_context_regressions.py` |
-| Context 请求装配、真实读取覆盖、资料预算与分页能力 | `context_input.py`、`skill_context.py`、`kernel/context_engine.py` | `tests/test_context_input.py`、`test_skill_context.py`、`test_skill_context_regressions.py`、`test_skill_entry_boundaries.py`、`test_tool_result_storage.py` |
+| Context 请求装配、真实读取覆盖、资料预算、分页能力与提交失败重试 | `context_input.py`、`skill_context.py`、`kernel/context_engine.py`、`kernel/loop.py` | `tests/test_context_input.py`、`test_context_request_commit.py`、`test_skill_context.py`、`test_skill_context_regressions.py`、`test_skill_entry_boundaries.py`、`test_tool_result_storage.py` |
 | Agent 借用、真实工具来源、公开兼容 API 与恢复 | `agent.py`、`agent_service.py`、`session_log.py`、`acp/__init__.py` | `tests/test_agent_run_options.py`、`test_agent_session_persistence.py`、`test_skill_entry_boundaries.py`、`test_skill_reference_persistence.py` |
 | CLI/ACP 选择、profile、预算与用量归因 | `cli.py`、`acp/__init__.py`、`tools/local_tool_exposure.py` | `tests/test_skill_preload.py`、`test_skill_prompt_layout.py`、`test_acp.py`、`test_local_tool_search.py` |
 | required 闭包、child 正文角色和能力限制 | `skill_dependencies.py`、`tools/sub_agent_capabilities.py`、`tools/sub_agent_tool.py` | `tests/test_sub_agent_capabilities.py`、`test_sub_agent_tool.py` |
