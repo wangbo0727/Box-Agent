@@ -44,6 +44,7 @@ from ..events import (
     MemoryProposalEvent,
     MemoryPromotionCandidate,
     PlanSnapshotEvent,
+    ProgressEvent,
     StepEnd,
     StepStart,
     StopReason,
