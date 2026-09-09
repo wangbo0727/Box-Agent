@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from ..schema import LLMResponse, Message, StreamEvent
-from ..tools.base import Tool
+from ..tools.base import Tool, ToolResult
 
 if TYPE_CHECKING:
     from ..events import AgentEvent
@@ -303,6 +303,30 @@ class ToolEnginePort(Protocol):
     async def aclose(self) -> None: ...
 
 
+@runtime_checkable
+class SkillContextPort(Protocol):
+    """Request projection fields consumed by the kernel after Skill preparation."""
+
+    messages: list[Message]
+    references: tuple[dict[str, Any], ...]
+    input_tokens: int
+
+
+@runtime_checkable
+class SkillEnginePort(Protocol):
+    """Borrowed session service for Skill reads and ordinary input references.
+
+    The outer assembly verifies source compatibility with its Skill tools;
+    the kernel consumes this behavior without discovering or rebinding sources.
+    Default built-in tools require the service's opaque ``loader`` binding to
+    match theirs; custom tool implementations own their binding contract.
+    """
+
+    def read(self, name: str, *, budget_chars: int | None = None, **kwargs: Any) -> ToolResult: ...
+
+    def prepare_context(self, messages: list[Message], *, budget_chars: int) -> SkillContextPort: ...
+
+
 @dataclass(frozen=True, slots=True)
 class KernelServices:
     """Resolved per-run capabilities consumed directly by the kernel."""
@@ -319,9 +343,12 @@ class KernelServices:
     tool_exposure: ToolExposurePort | None
     tool_result_store: ToolResultStorePort | None
     tool_engine: ToolEnginePort | None = None
+    skill_engine: SkillEnginePort | None = None
 
 
 __all__ = [
+    "SkillContextPort",
+    "SkillEnginePort",
     "HookBusPort",
     "KernelServices",
     "LLMPort",

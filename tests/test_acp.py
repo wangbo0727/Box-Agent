@@ -1559,6 +1559,239 @@ class PreloadedSkillThenGetSkillLLM(CaptureMessagesLLM):
         yield StreamEvent(type="finish", finish_reason="stop")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", [None, "slash", "selected_skill_names", "selectedSkillNames"])
+@pytest.mark.parametrize("with_skill_tool", [False, True])
+async def test_acp_skill_selection_is_ordinary_reference_not_automatic_system_body(tmp_path, selection, with_skill_tool):
+    from box_agent.tools.skill_tool import GetSkillTool
+
+    skill_dir = tmp_path / "skills" / "pptx"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: pptx\ndescription: PowerPoint pptx presentation\n---\n\n"
+        "UNIQUE_SKILL_REFERENCE_BODY\n", encoding="utf-8",
+    )
+    loader = SkillLoader(skill_dir.parent)
+    loader.discover_skills()
+    llm, conn = CaptureMessagesLLM(), DummyConn()
+    adapter = BoxACPAgent(conn, Config(
+        llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(max_steps=2, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_todo=False, enable_sub_agent=False),
+    ), llm, [GetSkillTool(loader)] if with_skill_tool else [],
+        f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    session = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    original = "/pptx explain this method" if selection == "slash" else "what is pptx?"
+    meta = {selection: ["pptx", "pptx", "missing"]} if selection not in (None, "slash") else {}
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": original}], field_meta=meta))
+    assert llm.calls
+    for role, content in llm.calls[0]:
+        if role in ("system", "developer"):
+            assert "UNIQUE_SKILL_REFERENCE_BODY" not in str(content)
+    supplied = [(role, content) for role, content in llm.calls[0] if "UNIQUE_SKILL_REFERENCE_BODY" in str(content)]
+    assert len(supplied) == (1 if selection else 0)
+    if supplied:
+        assert supplied[0][0] == "user"
+        assert "Host-provided Skill reference" in str(supplied[0][1])
+    state = adapter._sessions[session.sessionId]
+    assert ("get_skill" in state.agent.tools) is with_skill_tool
+    assert [m.content for m in state.agent.messages if m.role == "user"] == [original]
+    usage = [u.update.rawOutput for u in conn.updates
+             if isinstance(getattr(u.update, "rawOutput", None), dict)
+             and u.update.rawOutput.get("type") == "turn_usage"]
+    assert len(usage[-1]["skillInvocations"]) == (1 if selection else 0)
+    if selection:
+        assert usage[-1]["skillInvocations"][0]["activationSource"] == "preloaded"
+        assert usage[-1]["skillInvocations"][0]["usageRole"] == "primary"
+    conn.updates.clear()
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "hello"}]))
+    assert all("UNIQUE_SKILL_REFERENCE_BODY" not in str(content) for _, content in llm.calls[-1])
+    assert state.preloaded_skill_names == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("profile", "query", "selected", "expected"), [
+    ("standard", "research", False, 48),
+    ("deep", "hello", False, None),
+    ("fast", "research", False, None),
+    ("fast", "hello", True, 48),
+])
+async def test_acp_research_budget_uses_policy_not_automatic_body(tmp_path, monkeypatch, profile, query, selected, expected):
+    from box_agent.agent import Agent
+    from box_agent.tools.skill_tool import GetSkillTool
+    root = tmp_path / "skills" / "research-synthesis"
+    root.mkdir(parents=True)
+    root.joinpath("SKILL.md").write_text("---\nname: research-synthesis\ndescription: research\nkeywords: [research]\n---\nResearch body\n")
+    loader = SkillLoader(root.parent)
+    loader.discover_skills()
+    captured = []
+
+    async def capture(self, *, options=None, **kwargs):
+        captured.append(options.web_search_total_limit)
+        yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="done")
+
+    monkeypatch.setattr(Agent, "run_events", capture)
+    adapter = BoxACPAgent(DummyConn(), Config(
+        llm=LLMConfig(api_key="test"), agent=AgentConfig(workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_todo=False, enable_sub_agent=False),
+        tool_limits=ToolLimitsConfig(web_search={"total_calls": 12, "deep_research_total_calls": 48}),
+    ), DoneLLM(), [GetSkillTool(loader)], f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    session = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general", "execution_profile": profile}))
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": query}],
+        field_meta={"selected_skill_names": ["research-synthesis"]} if selected else {}))
+    assert captured == [expected]
+    state = adapter._sessions[session.sessionId]
+    assert ("research-synthesis" in state.explicitly_allowed_skill_names) is selected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("select_dependency", [False, True])
+async def test_acp_explicit_parent_and_real_dependency_reads_keep_wire_attribution(tmp_path, select_dependency):
+    from box_agent.tools.skill_tool import GetSkillTool
+    skills = tmp_path / "skills"
+    for name, extra in [("parent", "required_skills: [support]\n"), ("support", "")]:
+        folder = skills / name
+        folder.mkdir(parents=True)
+        folder.joinpath("SKILL.md").write_text(f"---\nname: {name}\ndescription: Method reference\n{extra}---\nBODY_{name}\n")
+    loader = SkillLoader(skills)
+    loader.discover_skills()
+
+    class ReadDependencyTwice(CaptureMessagesLLM):
+        async def generate_stream(self, messages, tools=None, **kwargs):
+            self.calls.append([(m.role, m.content) for m in messages])
+            if len(self.calls) < 3:
+                yield StreamEvent(type="finish", finish_reason="tool_use", tool_calls=[ToolCall(
+                    id=f"support-{len(self.calls)}", type="function",
+                    function=FunctionCall(name="get_skill", arguments={"skill_name": "support"}),
+                )])
+            else:
+                yield StreamEvent(type="text", delta="done")
+                yield StreamEvent(type="finish", finish_reason="stop")
+
+    llm, conn = ReadDependencyTwice(), DummyConn()
+    adapter = BoxACPAgent(conn, Config(llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(max_steps=4, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_todo=False)), llm,
+        [GetSkillTool(loader)], f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    session = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    names = ["parent", "support"] if select_dependency else ["parent"]
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "Proceed"}],
+        field_meta={"selected_skill_names": names}))
+    assert len(llm.calls) == 3
+    for snapshot in llm.calls:
+        assert all("BODY_" not in str(content) for role, content in snapshot if role in ("system", "developer"))
+        assert any("BODY_parent" in str(content) for role, content in snapshot if role == "user")
+    assert any("BODY_support" in str(c) for _, c in llm.calls[0]) is select_dependency
+    usages = [u.update.rawOutput for u in conn.updates if isinstance(getattr(u.update, "rawOutput", None), dict)
+              and u.update.rawOutput.get("type") == "turn_usage"]
+    invocations = usages[-1]["skillInvocations"]
+    assert [(i["skillName"], i["activationSource"], i["usageRole"], i.get("dependencyOf")) for i in invocations] == [
+        ("parent", "preloaded", "primary", None),
+        ("support", "preloaded" if select_dependency else "get_skill",
+         "primary" if select_dependency else "dependency", None if select_dependency else "parent"),
+    ]
+    assert len({i["invocationId"] for u in usages for i in u["skillInvocations"]}) == 2
+
+
+@pytest.mark.asyncio
+async def test_acp_explicit_missing_required_diagnostic_does_not_report_successful_skill_usage(tmp_path):
+    from box_agent.tools.skill_tool import GetSkillTool
+    folder = tmp_path / "skills" / "parent"
+    folder.mkdir(parents=True)
+    folder.joinpath("SKILL.md").write_text("---\nname: parent\ndescription: Method\nrequired_skills: [missing]\n---\nNEVER_DELIVER_PARENT_BODY\n")
+    loader = SkillLoader(folder.parent)
+    loader.discover_skills()
+    llm, conn = CaptureMessagesLLM(), DummyConn()
+    adapter = BoxACPAgent(conn, Config(llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_todo=False)), llm,
+        [GetSkillTool(loader)], f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    session = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "/parent proceed"}]))
+    assert llm.calls and all("NEVER_DELIVER_PARENT_BODY" not in str(c) for _, c in llm.calls[0])
+    payloads = [u.update.rawOutput for u in conn.updates if isinstance(getattr(u.update, "rawOutput", None), dict)]
+    assert not any(p.get("type") == "skills_usage" for p in payloads)
+    assert all(p.get("skillInvocations", []) == [] for p in payloads if p.get("type") == "turn_usage")
+
+
+@pytest.mark.asyncio
+async def test_acp_skill_catalog_tracks_session_profile_and_explicit_selection(tmp_path):
+    from box_agent.tools.skill_catalog_tool import ListSkillsTool
+    from box_agent.tools.skill_tool import GetSkillTool
+    folder = tmp_path / "skills" / "research-synthesis"
+    folder.mkdir(parents=True)
+    folder.joinpath("SKILL.md").write_text("---\nname: research-synthesis\ndescription: Research\n---\nMethod\n")
+    loader = SkillLoader(folder.parent)
+    loader.discover_skills()
+    original_list = ListSkillsTool(loader)
+    adapter = BoxACPAgent(DummyConn(), Config(llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_todo=False)), DoneLLM(),
+        [GetSkillTool(loader), original_list], f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    fast = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general", "execution_profile": "fast"}))
+    standard = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    fast_tool = adapter._sessions[fast.sessionId].agent.tools["list_skills"]
+    standard_tool = adapter._sessions[standard.sessionId].agent.tools["list_skills"]
+    assert not (await fast_tool.execute(query="research-synthesis")).raw_output["skills"][0]["available"]
+    assert (await standard_tool.execute(query="research-synthesis")).raw_output["skills"][0]["available"]
+    assert fast_tool is not standard_tool and fast_tool is not original_list
+    await adapter.prompt(SimpleNamespace(sessionId=fast.sessionId, prompt=[{"text": "hello"}],
+        field_meta={"selected_skill_names": ["research-synthesis"]}))
+    assert (await fast_tool.execute(query="research-synthesis")).raw_output["skills"][0]["available"]
+    await adapter.prompt(SimpleNamespace(sessionId=fast.sessionId, prompt=[{"text": "hello"}]))
+    assert not (await fast_tool.execute(query="research-synthesis")).raw_output["skills"][0]["available"]
+
+
+@pytest.mark.asyncio
+async def test_acp_expert_selection_respects_global_disabled_catalog_and_reads(tmp_path):
+    from box_agent.tools.skill_catalog_tool import ListSkillsTool
+    from box_agent.tools.skill_tool import GetSkillTool
+
+    skills_dir = tmp_path / "skills"
+    for name in ("disabled-method", "available-method"):
+        folder = skills_dir / name
+        folder.mkdir(parents=True)
+        folder.joinpath("SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Expert method\n---\nBODY_{name}\n"
+        )
+    settings = tmp_path / "skill-settings.json"
+    settings.write_text('{"disabledSkillNames": ["disabled-method"]}')
+    loader = SkillLoader(skills_dir, skill_settings_path=settings)
+    loader.discover_skills()
+    llm, conn = CaptureMessagesLLM(), DummyConn()
+    adapter = BoxACPAgent(conn, Config(llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_todo=False)), llm,
+        [GetSkillTool(loader), ListSkillsTool(loader)],
+        f"system\n{SKILL_SLOT_SENTINEL}", skill_loader=loader)
+    session = await adapter.newSession(SimpleNamespace(cwd=None, field_meta={
+        "session_mode": "general",
+        "expert": {"id": "expert-a", "name": "Expert", "required_skills": [
+            "disabled-method", "available-method"]},
+    }))
+    state = adapter._sessions[session.sessionId]
+    catalog = state.agent.tools["list_skills"]
+    get_skill = state.agent.tools["get_skill"]
+    disabled = (await catalog.execute(query="disabled-method")).raw_output["skills"][0]
+    assert disabled["available"] is False
+    assert "disabled" in disabled["unavailable_reason"]
+    assert "disabled-method" not in state.skill_selector.matched_skill_names
+    assert not (await get_skill.execute(skill_name="disabled-method")).success
+    assert (await catalog.execute(query="available-method")).raw_output["skills"][0]["available"]
+    assert (await get_skill.execute(skill_name="available-method")).success
+
+    await adapter.prompt(SimpleNamespace(sessionId=session.sessionId,
+        prompt=[{"text": "Use the selected expert methods"}],
+        field_meta={"selected_skill_names": ["disabled-method", "available-method"]}))
+    assert all("BODY_disabled-method" not in str(content) for _, content in llm.calls[0])
+    assert any("BODY_available-method" in str(content) for role, content in llm.calls[0] if role == "user")
+    assert state.explicitly_allowed_skill_names == {"available-method"}
+    assert not (await catalog.execute(query="disabled-method")).raw_output["skills"][0]["available"]
+    payloads = [u.update.rawOutput for u in conn.updates if isinstance(getattr(u.update, "rawOutput", None), dict)]
+    invocations = [p for p in payloads if p.get("type") == "turn_usage"][-1]["skillInvocations"]
+    assert [i["skillName"] for i in invocations] == ["available-method"]
+
+
 class GoalCompleteLLM:
     def __init__(self):
         self.calls = 0
@@ -3330,7 +3563,7 @@ async def test_acp_project_artifact_mode_publishes_generated_artifact(tmp_path):
         and update.update.rawOutput.get("type") == "artifact"
     ]
     assert response.stopReason == "end_turn"
-    assert agent._sessions[session.sessionId].preloaded_skill_names == ["roadmap"]
+    assert agent._sessions[session.sessionId].preloaded_skill_names == []
     assert (output_dir / "roadmap-v1.html").is_file()
     assert len(artifact_outputs) == 1
     assert artifact_outputs[0]["filename"] == "roadmap-v1.html"
@@ -4046,7 +4279,7 @@ async def test_acp_memory_match_ignores_host_ui_language_instruction(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_acp_preloads_matched_pptx_skill_for_deliverable(tmp_path):
+async def test_acp_matched_pptx_does_not_deliver_automatic_fulltext(tmp_path):
     skills_dir = tmp_path / "skills"
     pptx_dir = skills_dir / "pptx"
     pptx_dir.mkdir(parents=True)
@@ -4091,15 +4324,15 @@ async def test_acp_preloads_matched_pptx_skill_for_deliverable(tmp_path):
     )
 
     first_system_prompt = llm.calls[0][0][1]
-    assert "## Auto-Loaded Skill Instructions" in first_system_prompt
-    assert "# Skill: pptx" in first_system_prompt
-    assert "# PPTX FULL RULES" in first_system_prompt
+    assert "## Auto-Loaded Skill Instructions" not in first_system_prompt
+    assert "# Skill: pptx" not in first_system_prompt
+    assert "# PPTX FULL RULES" not in first_system_prompt
     assert prompt_capture.parent_system_prompt == first_system_prompt
-    assert agent._sessions[session.sessionId].preloaded_skill_names == ["pptx"]
+    assert agent._sessions[session.sessionId].preloaded_skill_names == []
 
 
 @pytest.mark.asyncio
-async def test_acp_unloads_auto_preloaded_skill_after_it_is_disabled(tmp_path):
+async def test_acp_disabled_skill_stays_out_of_automatic_context(tmp_path):
     skills_dir = tmp_path / "skills"
     settings_path = tmp_path / "skill-settings.json"
     settings_path.write_text('{"disabledSkillNames": []}', encoding="utf-8")
@@ -4147,8 +4380,8 @@ async def test_acp_unloads_auto_preloaded_skill_after_it_is_disabled(tmp_path):
         )
     )
     state = agent._sessions[session.sessionId]
-    assert state.preloaded_skill_names == ["pptx"]
-    assert "# PPTX FULL RULES" in state.agent.system_prompt
+    assert state.preloaded_skill_names == []
+    assert "# PPTX FULL RULES" not in state.agent.system_prompt
 
     settings_path.write_text('{"disabledSkillNames": ["pptx"]}', encoding="utf-8")
     await agent.prompt(
@@ -4164,7 +4397,7 @@ async def test_acp_unloads_auto_preloaded_skill_after_it_is_disabled(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_acp_host_selected_skill_preloads_exact_skill(tmp_path):
+async def test_acp_host_selection_records_exact_skill_before_run(tmp_path):
     skills_dir = tmp_path / "skills"
     pptx_dir = skills_dir / "pptx"
     pptx_dir.mkdir(parents=True)
@@ -4212,11 +4445,11 @@ async def test_acp_host_selected_skill_preloads_exact_skill(tmp_path):
     )
 
     assert "completion_gate" not in captured["kwargs"]
-    assert agent._sessions[session.sessionId].preloaded_skill_names == ["pptx"]
+    assert agent._sessions[session.sessionId].agent.skill_runtime.state.selected == ("pptx",)
 
 
 @pytest.mark.asyncio
-async def test_acp_explicit_external_skill_preloads_without_lifecycle_state(
+async def test_acp_explicit_external_selection_has_no_lifecycle_state(
     tmp_path,
 ):
     skills_dir = tmp_path / "skills"
@@ -4265,8 +4498,8 @@ async def test_acp_explicit_external_skill_preloads_without_lifecycle_state(
     )
     assert "completion_gate" not in captured[-1]
     state = agent._sessions[session.sessionId]
-    assert state.preloaded_skill_names == ["ppt-master"]
-    assert "# PPT MASTER RULES" in state.agent.system_prompt
+    assert state.agent.skill_runtime.state.selected == ("ppt-master",)
+    assert "# PPT MASTER RULES" not in state.agent.system_prompt
 
     await agent.prompt(
         SimpleNamespace(
@@ -4397,7 +4630,7 @@ async def test_acp_explicit_user_skill_does_not_create_legacy_runtime_state(tmp_
 
     assert "completion_gate" not in captured["kwargs"]
     state = agent._sessions[session.sessionId]
-    assert state.preloaded_skill_names == ["foreign-ppt"]
+    assert state.agent.skill_runtime.state.selected == ("foreign-ppt",)
     assert not hasattr(state, "pending_completion_gate")
 
 
@@ -4509,8 +4742,8 @@ async def test_acp_generic_ppt_request_does_not_preload_matched_lark_slides(tmp_
     )
 
     state = agent._sessions[session.sessionId]
-    assert state.preloaded_skill_names == ["pptx"]
-    assert "# PPTX FULL RULES" in state.agent.system_prompt
+    assert state.preloaded_skill_names == []
+    assert "# PPTX FULL RULES" not in state.agent.system_prompt
     assert "# LARK SLIDES RULES" not in state.agent.system_prompt
 
 
@@ -4576,13 +4809,11 @@ async def test_acp_host_selected_skill_prefers_exact_user_skill(tmp_path):
     )
 
     assert "completion_gate" not in captured["kwargs"]
-    assert agent._sessions[session.sessionId].preloaded_skill_names == [
-        "legacy-slides"
-    ]
+    assert agent._sessions[session.sessionId].agent.skill_runtime.state.selected == ("legacy-slides",)
 
 
 @pytest.mark.asyncio
-async def test_acp_does_not_repeat_preloaded_skill_in_get_skill_tool_context(tmp_path):
+async def test_acp_get_skill_delivers_real_tool_body_without_preload_owner(tmp_path):
     skills_dir = tmp_path / "skills"
     pptx_dir = skills_dir / "pptx"
     pptx_dir.mkdir(parents=True)
@@ -4625,14 +4856,13 @@ async def test_acp_does_not_repeat_preloaded_skill_in_get_skill_tool_context(tmp
         )
     )
 
-    assert agent._sessions[session.sessionId].preloaded_skill_names == ["pptx"]
+    assert agent._sessions[session.sessionId].preloaded_skill_names == []
     assert len(llm.calls) == 2
     tool_messages = [content for role, content in llm.calls[1] if role == "tool"]
-    assert tool_messages == [
-        "Skill 'pptx' is already preloaded in this session. "
-        "Follow its system instructions directly."
-    ]
-    assert "# PPTX FULL RULES" not in tool_messages[0]
+    assert len(tool_messages) == 1
+    assert "# PPTX FULL RULES" in tool_messages[0]
+    assert all("# PPTX FULL RULES" not in str(content) for snapshot in llm.calls
+               for role, content in snapshot if role in ("system", "developer"))
 
     other_session = await agent.newSession(
         SimpleNamespace(cwd=None, field_meta={"session_mode": "general"})
@@ -4642,13 +4872,13 @@ async def test_acp_does_not_repeat_preloaded_skill_in_get_skill_tool_context(tmp
     first_get_skill = first_state.agent.tools["get_skill"]
     other_get_skill = other_state.agent.tools["get_skill"]
     assert first_get_skill is not other_get_skill
-    assert first_get_skill.preloaded_skill_hashes is first_state.preloaded_skill_hashes
-    assert other_get_skill.preloaded_skill_hashes is other_state.preloaded_skill_hashes
+    assert first_state.agent.skill_runtime is not other_state.agent.skill_runtime
+    assert not other_state.agent.skill_runtime.state.reads
     assert other_state.preloaded_skill_hashes == {}
 
 
 @pytest.mark.asyncio
-async def test_acp_preloads_hyperframes_skill_when_runtime_available(tmp_path):
+async def test_acp_available_hyperframes_does_not_trigger_automatic_fulltext(tmp_path):
     skills_dir = tmp_path / "skills"
     hyperframes_dir = skills_dir / "hyperframes-video"
     hyperframes_dir.mkdir(parents=True)
@@ -4709,11 +4939,11 @@ async def test_acp_preloads_hyperframes_skill_when_runtime_available(tmp_path):
     state = agent._sessions[session.sessionId]
     first_system_prompt = llm.calls[0][0][1]
     assert "hyperframes-video" in state.skill_selector.matched_skill_names
-    assert "## Auto-Loaded Skill Instructions" in first_system_prompt
-    assert "# Skill: hyperframes-video" in first_system_prompt
-    assert "# HYPERFRAMES VIDEO FULL RULES" in first_system_prompt
+    assert "## Auto-Loaded Skill Instructions" not in first_system_prompt
+    assert "# Skill: hyperframes-video" not in first_system_prompt
+    assert "# HYPERFRAMES VIDEO FULL RULES" not in first_system_prompt
     assert prompt_capture.parent_system_prompt == first_system_prompt
-    assert state.preloaded_skill_names == ["hyperframes-video"]
+    assert state.preloaded_skill_names == []
     turn_usage_outputs = [
         update.update.rawOutput
         for update in conn.updates
@@ -4721,20 +4951,8 @@ async def test_acp_preloads_hyperframes_skill_when_runtime_available(tmp_path):
         and isinstance(update.update.rawOutput, dict)
         and update.update.rawOutput.get("type") == "turn_usage"
     ]
-    assert turn_usage_outputs[-1]["skills"] == ["hyperframes-video"]
-    assert [
-        {
-            key: invocation[key]
-            for key in ("skillName", "activationSource", "status")
-        }
-        for invocation in turn_usage_outputs[-1]["skillInvocations"]
-    ] == [
-        {
-            "skillName": "hyperframes-video",
-            "activationSource": "preloaded",
-            "status": "succeeded",
-        }
-    ]
+    assert turn_usage_outputs[-1]["skills"] == []
+    assert turn_usage_outputs[-1]["skillInvocations"] == []
 
 
 @pytest.mark.asyncio
@@ -4804,7 +5022,7 @@ async def test_acp_does_not_preload_hyperframes_skill_when_runtime_unavailable(t
 
 
 @pytest.mark.asyncio
-async def test_acp_preloads_required_skill_for_document_deliverable(tmp_path):
+async def test_acp_document_match_does_not_bill_root_or_dependency(tmp_path):
     skills_dir = tmp_path / "skills"
     pptx_dir = skills_dir / "pptx"
     pptx_dir.mkdir(parents=True)
@@ -4861,13 +5079,10 @@ async def test_acp_preloads_required_skill_for_document_deliverable(tmp_path):
     )
 
     first_system_prompt = llm.calls[0][0][1]
-    assert "# Skill: pptx" in first_system_prompt
-    assert "# Skill: html-templates" in first_system_prompt
-    assert "# HTML TEMPLATE RULES" in first_system_prompt
-    assert agent._sessions[session.sessionId].preloaded_skill_names == [
-        "pptx",
-        "html-templates",
-    ]
+    assert "# Skill: pptx" not in first_system_prompt
+    assert "# Skill: html-templates" not in first_system_prompt
+    assert "# HTML TEMPLATE RULES" not in first_system_prompt
+    assert agent._sessions[session.sessionId].preloaded_skill_names == []
     turn_usage_outputs = [
         update.update.rawOutput
         for update in conn.updates
@@ -4875,29 +5090,12 @@ async def test_acp_preloads_required_skill_for_document_deliverable(tmp_path):
         and isinstance(update.update.rawOutput, dict)
         and update.update.rawOutput.get("type") == "turn_usage"
     ]
-    assert turn_usage_outputs[-1]["skills"] == ["pptx", "html-templates"]
-    assert [
-        {
-            key: invocation.get(key)
-            for key in ("skillName", "usageRole", "dependencyOf")
-        }
-        for invocation in turn_usage_outputs[-1]["skillInvocations"]
-    ] == [
-        {
-            "skillName": "pptx",
-            "usageRole": "primary",
-            "dependencyOf": None,
-        },
-        {
-            "skillName": "html-templates",
-            "usageRole": "dependency",
-            "dependencyOf": "pptx",
-        },
-    ]
+    assert turn_usage_outputs[-1]["skills"] == []
+    assert turn_usage_outputs[-1]["skillInvocations"] == []
 
 
 @pytest.mark.asyncio
-async def test_acp_preloads_pptx_when_catalog_filter_drops_it(tmp_path):
+async def test_acp_filtered_document_candidate_does_not_trigger_fulltext(tmp_path):
     skills_dir = tmp_path / "skills"
     prompt = "做一份 12 页新员工入职培训 PPT，1920×1080 可编辑"
 
@@ -4956,10 +5154,10 @@ async def test_acp_preloads_pptx_when_catalog_filter_drops_it(tmp_path):
     state = agent._sessions[session.sessionId]
     first_system_prompt = llm.calls[0][0][1]
     assert "pptx" not in state.skill_selector.matched_skill_names
-    assert "## Auto-Loaded Skill Instructions" in first_system_prompt
-    assert "# Skill: pptx" in first_system_prompt
-    assert "# PPTX FULL RULES" in first_system_prompt
-    assert state.preloaded_skill_names == ["pptx"]
+    assert "## Auto-Loaded Skill Instructions" not in first_system_prompt
+    assert "# Skill: pptx" not in first_system_prompt
+    assert "# PPTX FULL RULES" not in first_system_prompt
+    assert state.preloaded_skill_names == []
     turn_usage_outputs = [
         update.update.rawOutput
         for update in conn.updates
@@ -4967,7 +5165,7 @@ async def test_acp_preloads_pptx_when_catalog_filter_drops_it(tmp_path):
         and isinstance(update.update.rawOutput, dict)
         and update.update.rawOutput.get("type") == "turn_usage"
     ]
-    assert turn_usage_outputs[-1]["skills"] == ["pptx"]
+    assert turn_usage_outputs[-1]["skills"] == []
 
 
 @pytest.mark.asyncio

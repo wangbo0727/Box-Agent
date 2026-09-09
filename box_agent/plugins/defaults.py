@@ -14,6 +14,7 @@ from ..kernel.ports import (
     SummaryLLMPort,
     ToolCatalogPort,
     ToolEnginePort,
+    SkillEnginePort,
     ToolExposurePort,
     ToolResultStorePort,
 )
@@ -41,8 +42,39 @@ DEFAULT_CAPABILITY_SCHEMA = CapabilitySchema(
         CapabilityBinding(ToolExposurePort, CapabilityPolicy.OPTIONAL_SINGLE),
         CapabilityBinding(ToolResultStorePort, CapabilityPolicy.OPTIONAL_SINGLE),
         CapabilityBinding(ToolEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
+        CapabilityBinding(SkillEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
     )
 )
+
+
+def skill_loader_from_catalog(tool_catalog: ToolCatalogPort):
+    """Resolve the built-in Skill tools' source without scanning or loading it."""
+    from ..tools.skill_catalog_tool import ListSkillsTool
+    from ..tools.skill_tool import GetSkillTool
+
+    loader = None
+    for tool in tool_catalog.values():
+        if not isinstance(tool, (GetSkillTool, ListSkillsTool)):
+            continue
+        if loader is not None and tool.skill_loader is not loader:
+            raise ValueError("Skill tools must share the same source loader.")
+        loader = tool.skill_loader
+    return loader
+
+
+def _validate_skill_source(tool_catalog: ToolCatalogPort, skill_engine: SkillEnginePort | None) -> None:
+    """Reject cross-source reader borrowing after static plugin replacement.
+
+    Loader identity includes current source precedence and availability policy.
+    Do not rebind a caller-owned engine and silently move its session facts to
+    another source. Custom tools and absent readers keep their own contracts.
+    """
+    loader = skill_loader_from_catalog(tool_catalog)
+    if loader is not None and skill_engine is not None and getattr(skill_engine, "loader", None) is not loader:
+        raise ValueError(
+            "Skill reader source does not match the final tool catalog. "
+            "Replace SkillEnginePort and ToolCatalogPort together using the same loader."
+        )
 
 
 def _captured_instance_descriptor(
@@ -76,6 +108,7 @@ def default_plugin_descriptors(
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
+    skill_engine: SkillEnginePort | None = None,
 ) -> tuple[PluginDescriptor, ...]:
     """Return deterministic descriptors for the supplied runtime instances."""
 
@@ -107,6 +140,7 @@ def default_plugin_descriptors(
             True,
         ),
         ("default.tool-engine", ToolEnginePort, tool_engine, True),
+        ("default.skill-engine", SkillEnginePort, skill_engine, True),
     )
     return tuple(
         _captured_instance_descriptor(plugin_id, port_type, instance)
@@ -129,6 +163,7 @@ def create_default_plugin_host(
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
+    skill_engine: SkillEnginePort | None = None,
 ) -> PluginHost:
     """Create a fresh static host for one outer agent-loop run."""
 
@@ -146,6 +181,7 @@ def create_default_plugin_host(
             tool_exposure=tool_exposure,
             tool_result_store=tool_result_store,
             tool_engine=tool_engine,
+            skill_engine=skill_engine,
         ),
         schema=DEFAULT_CAPABILITY_SCHEMA,
     )
@@ -154,6 +190,7 @@ def create_default_plugin_host(
 def kernel_services_from_registry(registry: ActivatedRegistry) -> KernelServices:
     """Map one immutable activated registry to the kernel's immutable bundle."""
 
+    _validate_skill_source(registry.require(ToolCatalogPort), registry.get(SkillEnginePort))
     return KernelServices(
         llm=registry.require(LLMPort),
         summary_llm=registry.get(SummaryLLMPort),
@@ -167,6 +204,7 @@ def kernel_services_from_registry(registry: ActivatedRegistry) -> KernelServices
         tool_exposure=registry.get(ToolExposurePort),
         tool_result_store=registry.get(ToolResultStorePort),
         tool_engine=registry.get(ToolEnginePort),
+        skill_engine=registry.get(SkillEnginePort),
     )
 
 
@@ -184,9 +222,11 @@ def compose_default_services(
     tool_exposure: ToolExposurePort | None,
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
+    skill_engine: SkillEnginePort | None = None,
 ) -> KernelServices:
     """Return one immutable bundle without discovery, I/O, or object creation."""
 
+    _validate_skill_source(tool_catalog, skill_engine)
     return KernelServices(
         llm=llm,
         summary_llm=summary_llm,
@@ -200,6 +240,7 @@ def compose_default_services(
         tool_exposure=tool_exposure,
         tool_result_store=tool_result_store,
         tool_engine=tool_engine,
+        skill_engine=skill_engine,
     )
 
 

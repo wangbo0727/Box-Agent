@@ -150,7 +150,7 @@ from box_agent.goal_runtime import (
     GoalAutopilotController,
 )
 from box_agent.mcp_runtime import MCPRuntimeController
-from box_agent.skill_runtime import prepare_auto_loaded_skills
+from box_agent.skill_runtime import SkillRuntime
 from box_agent.turn_runtime import sync_skill_cache_fingerprint_context
 from box_agent.client_info import ClientInfo, scoped_client_info
 from box_agent.llm import LLMClient, SessionBoundLLM
@@ -215,12 +215,7 @@ from box_agent.tools.runtime import (
 )
 from box_agent.tools.skill_preload import (
     SkillPreloadAttribution,
-    # Retained for downstream monkeypatch/import compatibility; active turns
-    # use ``prepare_auto_loaded_skills`` below.
-    build_auto_loaded_skills_prompt,
-    host_runtime_preload_skill_names,
     strip_auto_loaded_skills,
-    turn_preload_skill_names,
     web_search_total_limit_for_active_skills,
 )
 from box_agent.workspace_registry import WorkspaceRegistry, WorkspaceRegistryError
@@ -1258,73 +1253,6 @@ class BoxACPAgent:
             preloaded_skills=",".join(fingerprint.get("preloaded_skill_names") or []),
         )
 
-    def _host_runtime_preload_skill_names(
-        self,
-        matched_skill_names: tuple[str, ...],
-        env_context: EnvContext | None,
-        user_text: str | None,
-    ) -> list[str]:
-        return host_runtime_preload_skill_names(
-            matched_skill_names,
-            env_context,
-            user_text,
-        )
-
-    def _turn_preload_skill_names(
-        self,
-        matched_skill_names: tuple[str, ...],
-        env_context: EnvContext | None,
-        user_text: str | None,
-        *,
-        selected_skill_names: tuple[str, ...] = (),
-    ) -> list[str]:
-        return turn_preload_skill_names(
-            matched_skill_names,
-            env_context,
-            user_text,
-            selected_skill_names=selected_skill_names,
-        )
-
-    def _apply_auto_loaded_skills(
-        self,
-        state: SessionState,
-        session_id: str,
-        skill_names: list[str],
-    ) -> None:
-        skill_loader = state.skill_loader or self._skill_loader
-        if not skill_loader:
-            self._sync_cache_fingerprint_context(state)
-            return
-        include_disabled = state.expert_context is not None
-        result, unloaded_skill_names = prepare_auto_loaded_skills(
-            skill_loader,
-            state.agent.system_prompt,
-            skill_names,
-            include_disabled=include_disabled,
-            preloaded_skill_names=state.preloaded_skill_names,
-            preloaded_skill_hashes=state.preloaded_skill_hashes,
-            preloaded_skill_attributions=state.preloaded_skill_attributions,
-            prompt_builder=build_auto_loaded_skills_prompt,
-        )
-        for skill_name in result.missing_names:
-            log.warn("skills/preload_missing", session_id=session_id, skill=skill_name)
-        self._sync_cache_fingerprint_context(state)
-        if result.changed:
-            self._set_agent_system_prompt(state.agent, result.system_prompt)
-        if unloaded_skill_names:
-            log.info(
-                "skills/auto_unloaded",
-                session_id=session_id,
-                skills=",".join(sorted(unloaded_skill_names)),
-            )
-        if result.loaded_names and result.changed:
-            log.info(
-                "skills/preloaded",
-                session_id=session_id,
-                skills=",".join(state.preloaded_skill_names),
-                prompt_chars=len(result.system_prompt),
-            )
-
     async def _ensure_mcp_loaded(self) -> None:
         """Finalize startup MCP discovery on the first prompt.
 
@@ -1849,22 +1777,26 @@ class BoxACPAgent:
         else:
             tools = list(self._base_tools)
             if session_skill_loader:
+                from box_agent.tools.skill_catalog_tool import ListSkillsTool
                 from box_agent.tools.skill_tool import GetSkillTool
 
                 tools = [
-                    GetSkillTool(
+                    (ListSkillsTool if tool.name == "list_skills" else GetSkillTool)(
                         session_skill_loader,
-                        include_disabled=expert_context is not None,
-                        preloaded_skill_hashes=preloaded_skill_hashes,
-                        blocked_skill_names=blocked_skill_names,
+                        include_disabled=False,
+                        allowed_skill_names=getattr(tool, "allowed_skill_names", None),
+                        blocked_skill_names=(
+                            frozenset(getattr(tool, "blocked_skill_names", ()))
+                            | blocked_skill_names
+                        ),
                         explicitly_allowed_skill_names=(
                             explicitly_allowed_skill_names
                         ),
                     )
-                    if isinstance(tool, GetSkillTool)
+                    if isinstance(tool, (GetSkillTool, ListSkillsTool))
                     or (
                         expert_context is not None
-                        and getattr(tool, "name", "") == "get_skill"
+                        and getattr(tool, "name", "") in {"get_skill", "list_skills"}
                     )
                     else tool
                     for tool in tools
@@ -1979,6 +1911,8 @@ class BoxACPAgent:
             llm_client=session_llm,
             system_prompt=system_prompt,
             tools=tools,
+            skill_runtime=(SkillRuntime(session_skill_loader, session_log=session_log)
+                           if session_skill_loader is not None else None),
             max_steps=self._config.agent.max_steps,
             tool_limits=self._config.tool_limits,
             workspace_dir=str(workspace),
@@ -2009,40 +1943,6 @@ class BoxACPAgent:
             skillhub_search_tool.set_snapshot_provider(
                 lambda: capability_snapshot(agent, session_skill_loader)
             )
-
-        if agent.restored_skills:
-            try:
-                if session_skill_loader is None:
-                    raise ValueError(
-                        "persisted active Skills cannot be restored without a SkillLoader"
-                    )
-                restored_skill_prompts: list[tuple[str, str, str, int]] = []
-                for item in agent.restored_skills:
-                    name = item.get("name")
-                    prompt_hash = item.get("sha256")
-                    load_order = item.get("loadOrder")
-                    if (
-                        not isinstance(name, str)
-                        or not isinstance(prompt_hash, str)
-                        or not isinstance(load_order, int)
-                    ):
-                        raise ValueError("persisted active Skill metadata is invalid")
-                    skill = session_skill_loader.get_skill(
-                        name,
-                        include_disabled=expert_context is not None,
-                    )
-                    if skill is None:
-                        raise ValueError(
-                            f"persisted active Skill {name!r} is unavailable"
-                        )
-                    restored_skill_prompts.append(
-                        (name, skill.to_prompt(), prompt_hash, load_order)
-                    )
-                agent.restore_active_skill_instructions(restored_skill_prompts)
-            except Exception:
-                if session_log is not None:
-                    session_log.close()
-                raise
 
         if initial_goal_request is not None:
             goal_result = self._apply_goal_action(agent, initial_goal_request)
@@ -2131,7 +2031,7 @@ class BoxACPAgent:
                 self._set_agent_system_prompt(agent, relocated_prompt)
             selector = SkillSelector(
                 session_skill_loader,
-                include_disabled=expert_context is not None,
+                include_disabled=False,
             )
             selector.bind(agent.messages[0].content)
             if expert_context:
@@ -2869,20 +2769,14 @@ class BoxACPAgent:
                 skills=",".join(host_selected_skill_names),
             )
 
-        if state.skill_selector is not None:
-            preload_names = self._turn_preload_skill_names(
-                state.skill_selector.matched_skill_names,
-                state.env_context,
-                plan_detection_text,
-                selected_skill_names=explicitly_selected_skill_names,
-            )
-            state.explicitly_allowed_skill_names.update(preload_names)
-            if preload_names:
-                self._apply_auto_loaded_skills(state, session_id, preload_names)
-            elif state.preloaded_skill_names:
-                self._apply_auto_loaded_skills(state, session_id, [])
-            else:
-                self._sync_cache_fingerprint_context(state)
+        if state.agent.skill_runtime is not None:
+            state.agent.skill_runtime.select(explicitly_selected_skill_names)
+        # Compatibility views describe only successful delivery in this turn;
+        # selection and directory matches do not own a second loading state.
+        state.preloaded_skill_names.clear()
+        state.preloaded_skill_hashes.clear()
+        state.preloaded_skill_attributions.clear()
+        self._sync_cache_fingerprint_context(state)
 
         if image_attachment_context:
             user_text = f"{user_text}\n\n{image_attachment_context}"
@@ -4022,10 +3916,6 @@ class BoxACPAgent:
 
         skill_name_by_tool_call_id: dict[str, str] = {}
         used_skill_names: list[str] = []
-        for preloaded_skill_name in run_handle.preloaded_skill_names:
-            preloaded_skill_name = preloaded_skill_name.strip()
-            if preloaded_skill_name and preloaded_skill_name not in used_skill_names:
-                used_skill_names.append(preloaded_skill_name)
         skill_invocations: list[dict[str, Any]] = []
         recorded_skill_invocation_ids: set[str] = set()
         used_tool_counts: dict[str, int] = {}
@@ -4057,6 +3947,7 @@ class BoxACPAgent:
             *,
             usage_role: str = "primary",
             dependency_of: str | None = None,
+            metadata: dict[str, Any] | None = None,
         ) -> dict[str, Any] | None:
             invocation_key = "\x1f".join(
                 (
@@ -4079,10 +3970,17 @@ class BoxACPAgent:
             if usage_role == "dependency" and dependency_of:
                 invocation["dependencyOf"] = dependency_of
 
-            if state.skill_loader is not None:
+            if metadata:
+                for field, key in (("skillSource", "source"),
+                                   ("skillVersion", "skill_version"),
+                                   ("instructionDigest", "instruction_digest")):
+                    value = metadata.get(key)
+                    if isinstance(value, str) and value:
+                        invocation[field] = value
+            elif state.skill_loader is not None:
                 skill = state.skill_loader.get_skill(
                     skill_name,
-                    include_disabled=state.expert_context is not None,
+                    include_disabled=False,
                 )
                 # A broken SKILL.md returns a diagnostic from get_skill but does
                 # not activate usable instructions, so it is not a billable fact.
@@ -4122,21 +4020,45 @@ class BoxACPAgent:
             skill_invocations.append(invocation)
             return invocation
 
-        for preloaded_skill_name in used_skill_names:
-            attribution = run_handle.preloaded_skill_attributions.get(preloaded_skill_name)
-            _record_skill_invocation(
-                preloaded_skill_name,
-                "preloaded",
-                usage_role=attribution.usage_role if attribution else "primary",
-                dependency_of=attribution.dependency_of if attribution else None,
-            )
+        def _skill_usage_attribution(skill_name: str, metadata: dict[str, Any]) -> tuple[str, str | None]:
+            if skill_name in explicitly_selected_skill_names:
+                return "primary", None
+            if metadata.get("usage_role") == "dependency" and metadata.get("dependency_of"):
+                return "dependency", metadata["dependency_of"]
+            runtime = agent.skill_runtime
+            deliveries = runtime.turn_deliveries if runtime is not None else {}
+            parents = {
+                dependency: parent
+                for parent, delivery in deliveries.items()
+                for dependency in delivery.get("required_skills", ())
+                if dependency not in explicitly_selected_skill_names
+            }
+            parent = parents.get(skill_name)
+            if parent is None:
+                return "primary", None
+            visited = {skill_name}
+            while parent in parents and parent not in visited:
+                visited.add(parent)
+                parent = parents[parent]
+            return "dependency", parent
 
-        def _record_skill_usage(skill_name: str | None) -> dict[str, Any] | None:
+        def _record_skill_usage(skill_name: str | None, raw_output: Any = None) -> dict[str, Any] | None:
             if not skill_name:
+                return None
+            metadata = raw_output.get("skill_reference", {}) if isinstance(raw_output, dict) else {}
+            runtime = agent.skill_runtime
+            if not metadata and runtime is not None:
+                metadata = runtime.turn_deliveries.get(skill_name, {})
+            # Real Skill reads must carry a successful reference, not merely
+            # ToolResult.success on a diagnostic. Legacy custom Skill tools
+            # without a loader retain their existing event contract.
+            if not metadata and getattr(agent.tools.get("get_skill"), "skill_loader", None) is not None:
                 return None
             if skill_name not in used_skill_names:
                 used_skill_names.append(skill_name)
-            _record_skill_invocation(skill_name, "get_skill")
+            role, dependency = _skill_usage_attribution(skill_name, metadata)
+            _record_skill_invocation(skill_name, "get_skill", usage_role=role,
+                                     dependency_of=dependency, metadata=metadata)
             return {
                 "type": "skills_usage",
                 "skills": list(used_skill_names),
@@ -4259,16 +4181,32 @@ class BoxACPAgent:
                 update_tool_call(tool_call_id, raw_output=payload),
             )
 
-        for explicitly_selected_skill_name in explicitly_selected_skill_names:
-            await _send_skill_usage(
-                f"explicit-skill-{uuid4().hex[:8]}",
-                {
-                    "type": "skills_usage",
-                    "skills": list(used_skill_names),
-                    "current": explicitly_selected_skill_name,
-                    "activationSource": "explicit",
-                },
-            )
+        delivered_explicit_names: set[str] = set()
+
+        async def _sync_explicit_skill_deliveries() -> None:
+            runtime = agent.skill_runtime
+            if runtime is None:
+                return
+            for name in explicitly_selected_skill_names:
+                metadata = runtime.turn_deliveries.get(name)
+                if name in delivered_explicit_names or not metadata or metadata.get("reason") != "explicit":
+                    continue
+                delivered_explicit_names.add(name)
+                if name not in used_skill_names:
+                    used_skill_names.append(name)
+                role, dependency = _skill_usage_attribution(name, metadata)
+                _record_skill_invocation(name, "preloaded", usage_role=role,
+                                         dependency_of=dependency, metadata=metadata)
+                state.preloaded_skill_names.append(name)
+                state.preloaded_skill_hashes[name] = metadata["revision"]
+                state.preloaded_skill_attributions[name] = SkillPreloadAttribution(
+                    skill_name=name, usage_role=role, dependency_of=dependency,
+                )
+                await _send_skill_usage(f"explicit-skill-{uuid4().hex[:8]}", {
+                    "type": "skills_usage", "skills": list(used_skill_names),
+                    "current": name, "activationSource": "explicit",
+                })
+            self._sync_cache_fingerprint_context(state)
 
         async def _generate_follow_up_suggestions(
             latest_user_request: str,
@@ -4411,16 +4349,9 @@ class BoxACPAgent:
                     if run_handle.skill_selector is not None
                     else ()
                 ),
-                # Explicit user requirements are active policy inputs even
-                # before the model calls get_skill on demand.
-                tuple(
-                    dict.fromkeys(
-                        (
-                            *run_handle.preloaded_skill_names,
-                            *sorted(run_handle.explicitly_allowed_skill_names),
-                        )
-                    )
-                ),
+                # Explicit user policy is independent of whether its reference
+                # fits in the next request. Ordinary reads do not raise quotas.
+                tuple(sorted(run_handle.explicitly_allowed_skill_names)),
                 tool_limits=self._config.tool_limits,
                 execution_profile=state.execution_profile,
             ),
@@ -4441,6 +4372,7 @@ class BoxACPAgent:
             )
         async for event in events:
             try:
+                await _sync_explicit_skill_deliveries()
                 match event:
                     case ThinkingEvent() if event._streaming:
                         # Stream thinking deltas in real-time
@@ -4632,7 +4564,7 @@ class BoxACPAgent:
                             )
                         _update_pending_plan_approval_from_raw(state, raw_output)
                         skill_usage_payload = (
-                            _record_skill_usage(skill_name_by_tool_call_id.get(tid))
+                            _record_skill_usage(skill_name_by_tool_call_id.get(tid), raw_output)
                             if tname == "get_skill" and ok
                             else None
                         )
@@ -4810,7 +4742,7 @@ class BoxACPAgent:
                             and inner.success
                         ):
                             skill_usage_payload = _record_skill_usage(
-                                skill_name_by_tool_call_id.get(inner.tool_call_id)
+                                skill_name_by_tool_call_id.get(inner.tool_call_id), inner.raw_output,
                             )
                             if skill_usage_payload:
                                 await _send_skill_usage(tid, skill_usage_payload)

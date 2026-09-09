@@ -25,6 +25,29 @@ from box_agent.tools.runtime import SkillRuntimeContext
 
 
 _ALWAYS_BASE = {"create_scheduled_task", "mcp_config"}
+_SKILLS = {"get_skill", "list_skills"}
+_LIST_SKILLS_SCHEMA = {
+    "aliases": [],
+    "schema": {
+        "name": "list_skills",
+        "description": (
+            "List or search locally installed Skill names, descriptions and availability. "
+            "Use an empty query to browse all available Skills, or an exact name to "
+            "diagnose an unavailable Skill. This does not load instructions or access "
+            "SkillHub. Follow next_offset for more results; if revision changes, restart "
+            "from offset 0. Use get_skill to read a chosen Skill."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "default": ""},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
 _ALWAYS_WORKSPACE = {
     "request_user_input", "request_user_decision", "report_execution_result",
     "obsidian_create_note", "obsidian_update_note", "obsidian_daily_note",
@@ -204,6 +227,19 @@ def _normalized_schema(schema, profile):
 
 def _assert_schema_contract(tools, profile, *, child_read_tools=()):
     expected = json.loads(_SCHEMA_FIXTURE.read_text(encoding="utf-8"))["tools"]
+    # Preserve the old fixture and enumerate the Skill Engine's public additions.
+    expected["list_skills"] = _LIST_SKILLS_SCHEMA
+    expected["get_skill"]["schema"]["description"] = (
+        "Read a Skill's method and resource paths. Follow next_offset with the returned revision "
+        "when paged. Read required_skills before their steps; related_skills are optional. "
+        "Skill guidance does not grant tools or permission. Use list_skills for names and availability."
+    )
+    expected["get_skill"]["schema"]["input_schema"]["additionalProperties"] = False
+    expected["get_skill"]["schema"]["input_schema"]["properties"].update({
+        "offset": {"type": "integer", "minimum": 0, "description": "Zero-based line offset; omit to read the whole Skill when it fits."},
+        "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines for a bounded page."},
+        "revision": {"type": "string", "description": "Version returned by a previous page; restart if it changed."},
+    })
     index = build_tool_name_index(tools)
     expected_call_names = set()
     for tool in tools:
@@ -251,10 +287,10 @@ def _assert_schema_contract(tools, profile, *, child_read_tools=()):
         pytest.param({"flags": {"enable_todo": True}}, _TODO, id="todo"),
         pytest.param({"flags": {"enable_plan": True}}, _PLAN, id="plan"),
         pytest.param({"memory": True}, _MEMORY, id="memory-manager"),
-        pytest.param({"flags": {"enable_skills": True}}, {"get_skill"}, id="empty-skills"),
+        pytest.param({"flags": {"enable_skills": True}}, _SKILLS, id="empty-skills"),
         pytest.param(
             {"flags": {"enable_skills": True}, "defer_skills": True},
-            {"get_skill"}, id="deferred-empty-skills",
+            _SKILLS, id="deferred-empty-skills",
         ),
         pytest.param({"flags": {"enable_mcp": True}}, {"fixture_lookup"}, id="mcp"),
         pytest.param({"flags": {"enable_sub_agent": True}}, set(), id="subagent-no-llm"),
@@ -269,14 +305,14 @@ def _assert_schema_contract(tools, profile, *, child_read_tools=()):
         pytest.param({"image_endpoint": True}, {"generate_image"}, id="image-service"),
         pytest.param(
             {"defaults": True, "llm_mode": "text"},
-            _FILES | _BASH | _TODO | _PLAN | {"get_skill", "sub_agent", "fixture_lookup"},
+            _FILES | _BASH | _TODO | _PLAN | _SKILLS | {"sub_agent", "fixture_lookup"},
             id="config-defaults",
         ),
         pytest.param(
             {"defaults": True, "llm_mode": "vision", "memory": True,
              "sandbox": True, "image_endpoint": True, "process_owner_id": "fixture-session"},
-            _FILES | _BASH | _TODO | _PLAN | _MEMORY | _SANDBOX
-            | {"get_skill", "sub_agent", "fixture_lookup", "inspect_images", "generate_image"},
+            _FILES | _BASH | _TODO | _PLAN | _MEMORY | _SANDBOX | _SKILLS
+            | {"sub_agent", "fixture_lookup", "inspect_images", "generate_image"},
             id="all-capabilities-session-owned",
         ),
     ],
@@ -360,6 +396,7 @@ async def test_setup_preserves_shared_resources_and_session_owners(isolated_setu
     assert tools["plan_write"]._store is tools["plan_read"]._store
     assert tools["plan_write"]._store is not tools["todo_write"]._store
     assert tools["get_skill"].skill_loader is assembly.loader
+    assert tools["list_skills"].skill_loader is assembly.loader
     assert set(assembly.loader.loaded_skills) == {"fixture-skill"}
     assert tools["sub_agent"]._resolve_skill_loader() is assembly.loader
     assert tools["sandbox_status"]._bound_sandbox_tool is tools["execute_code"]

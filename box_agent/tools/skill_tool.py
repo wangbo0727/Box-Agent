@@ -5,10 +5,9 @@ Implements Progressive Disclosure (Level 2): Load full skill content when needed
 """
 
 from pathlib import Path
-from hashlib import sha256
 from typing import Any, Dict, List, Literal, Mapping, MutableSet, Optional, Tuple
 
-from .base import Tool, ToolResult
+from .base import Tool, ToolResult, ToolInvocationContext
 from .skill_loader import SkillLoader
 
 SkillSource = Literal["builtin", "user"]
@@ -18,19 +17,21 @@ class GetSkillTool(Tool):
     """Tool to get detailed information about a specific skill"""
 
     aliases = ("skill_view",)
-    loads_active_skill_instructions = True
+    uses_invocation_context = True
 
     def __init__(
         self,
         skill_loader: SkillLoader,
         *,
         include_disabled: bool = False,
+        allowed_skill_names: frozenset[str] | None = None,
         preloaded_skill_hashes: Mapping[str, str] | None = None,
         blocked_skill_names: set[str] | frozenset[str] | None = None,
         explicitly_allowed_skill_names: MutableSet[str] | None = None,
     ):
         self.skill_loader = skill_loader
         self.include_disabled = include_disabled
+        self.allowed_skill_names = allowed_skill_names
         self.preloaded_skill_hashes = preloaded_skill_hashes
         self.blocked_skill_names = blocked_skill_names or frozenset()
         self.explicitly_allowed_skill_names = explicitly_allowed_skill_names
@@ -41,7 +42,11 @@ class GetSkillTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Get complete content and guidance for a specified skill, used for executing specific types of tasks"
+        return (
+            "Read a Skill's method and resource paths. Follow next_offset with the returned revision "
+            "when paged. Read required_skills before their steps; related_skills are optional. "
+            "Skill guidance does not grant tools or permission. Use list_skills for names and availability."
+        )
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -51,80 +56,46 @@ class GetSkillTool(Tool):
                 "skill_name": {
                     "type": "string",
                     "description": "Name of the skill to retrieve (use list_skills to view available skills)",
-                }
+                },
+                "offset": {"type": "integer", "minimum": 0, "description": "Zero-based line offset; omit to read the whole Skill when it fits."},
+                "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines for a bounded page."},
+                "revision": {"type": "string", "description": "Version returned by a previous page; restart if it changed."},
             },
             "required": ["skill_name"],
+            "additionalProperties": False,
         }
 
-    async def execute(self, skill_name: str) -> ToolResult:
-        """Get detailed information about specified skill"""
-        normalized_name = skill_name.strip()
-        if (
-            normalized_name in self.blocked_skill_names
-            and not (
-                self.preloaded_skill_hashes
-                and normalized_name in self.preloaded_skill_hashes
-            )
-            and (
-                self.explicitly_allowed_skill_names is None
-                or normalized_name not in self.explicitly_allowed_skill_names
-            )
-        ):
-            return ToolResult(
-                success=False,
-                content="",
-                error=(
-                    f"Skill '{normalized_name}' is disabled by the active execution "
-                    "profile unless the user explicitly requests it. Continue with "
-                    "bounded direct work and do not retry loading this Skill."
-                ),
-            )
+    def _read(self, skill_name: str, *, reader=None, **kwargs: Any) -> ToolResult:
+        from ..skill_runtime import SkillRuntime
+        from ..skill_dependencies import resolve_required_skills, SkillDependencyError
 
-        # Auto-reload if the user skills directory has been touched since last scan
+        name = skill_name.strip()
+        if self.allowed_skill_names is not None and name not in self.allowed_skill_names:
+            return ToolResult(success=False, error="Skill is outside this task's assigned scope.")
+        if name in self.blocked_skill_names and name not in (self.explicitly_allowed_skill_names or ()):
+            return ToolResult(success=False, error=(
+                f"Skill '{name}' is disabled by the active execution profile unless the user explicitly requests it. "
+                "Continue with bounded direct work and do not retry loading this Skill."))
         self.skill_loader.maybe_reload()
+        if self.allowed_skill_names is not None:
+            try:
+                dependencies = resolve_required_skills(self.skill_loader, [name])
+            except SkillDependencyError as exc:
+                return ToolResult(success=False, error=str(exc), raw_output={"code": exc.code})
+            if any(skill.name not in self.allowed_skill_names for skill in dependencies):
+                return ToolResult(success=False, error="Required Skill is outside this task's assigned scope.")
+        # Legacy preload hashes are not evidence that text survives in this
+        # request. Only the session reader can issue a verified reuse receipt.
+        read = reader or SkillRuntime(self.skill_loader).read
+        return read(name, **kwargs)
 
-        skill = self.skill_loader.get_skill(
-            skill_name,
-            include_disabled=self.include_disabled,
-        )
+    async def execute(self, skill_name: str, offset: int = 0, limit: int | None = None,
+                      revision: str | None = None) -> ToolResult:
+        return self._read(skill_name, offset=offset, limit=limit, revision=revision)
 
-        if not skill:
-            available = ", ".join(
-                self.skill_loader.list_skills(include_disabled=self.include_disabled)
-            )
-            return ToolResult(
-                success=False,
-                content="",
-                error=f"Skill '{skill_name}' does not exist. Available skills: {available}",
-            )
-
-        # A broken skill (SKILL.md present but unparseable) returns a
-        # diagnostic prompt so the model doesn't invent guidance from a
-        # directory name it can't verify. Success is True — this is a real
-        # answer to "give me the skill", not a tool failure that should be
-        # retried. The rendered content clearly tells the model to ask the
-        # user to fix SKILL.md instead of proceeding.
-        result = skill.to_prompt()
-        if self.preloaded_skill_hashes and self.preloaded_skill_hashes.get(
-            skill.name
-        ) == sha256(result.encode("utf-8")).hexdigest():
-            message = (
-                f"Skill '{skill.name}' is already preloaded in this session. "
-                "Follow its system instructions directly."
-            )
-            return ToolResult(
-                success=True,
-                content=message,
-                model_context=message,
-            )
-        raw_output = None
-        if skill.broken:
-            raw_output = {
-                "broken": True,
-                "broken_reason": skill.broken_reason,
-                "skill_path": str(skill.skill_path) if skill.skill_path else None,
-            }
-        return ToolResult(success=True, content=result, raw_output=raw_output)
+    async def _invoke_validated(self, arguments: dict[str, Any], *,
+                                context: ToolInvocationContext | None) -> ToolResult:
+        return self._read(**arguments, reader=context.skill_reader if context is not None else None)
 
 
 def create_skill_tools(
@@ -159,5 +130,7 @@ def create_skill_tools(
 
         _sys.stderr.write(f"✅ Discovered {len(skills)} Claude Skills\n")
 
-    tools: List[Tool] = [GetSkillTool(loader)]
+    from .skill_catalog_tool import ListSkillsTool
+
+    tools: List[Tool] = [GetSkillTool(loader), ListSkillsTool(loader)]
     return tools, loader

@@ -55,6 +55,7 @@ class ToolRunContext:
     logger: AgentLogger | None = None
     resource_ledger: ContextResourceLedger | None = None
     activate_skill: Callable[[str, str], None] | None = None
+    skill_reader: Callable[..., ToolResult] | None = None
 
 
 @dataclass(frozen=True, slots=True)

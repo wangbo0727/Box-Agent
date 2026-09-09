@@ -71,11 +71,7 @@ from box_agent.tools.mcp_loader import (
     reconnect_auth_failed_mcp_servers_if_token_changed,
 )
 from box_agent.tools.skill_preload import (
-    # Compatibility import for callers that patched the historical builder;
-    # turn execution delegates to ``prepare_auto_loaded_skills`` below.
-    build_auto_loaded_skills_prompt,
     resolve_explicit_skill_invocation,
-    turn_preload_skill_names,
 )
 from box_agent.tools.setup import (
     add_workspace_tools,
@@ -108,7 +104,7 @@ from box_agent.project_context import (
     build_project_startup_context_prompt,
     compose_prompt_segments,
 )
-from box_agent.skill_runtime import prepare_auto_loaded_skills
+from box_agent.skill_runtime import SkillRuntime
 from box_agent.workspace_registry import WorkspaceRegistry, WorkspaceRegistryError
 
 from box_agent.user_paths import state_path
@@ -2014,20 +2010,22 @@ async def run_agent(
     tools, skill_loader, mcp_task, _skill_task = await initialize_base_tools(
         config, memory_manager=memory_mgr, llm=llm_client
     )
-    cli_preloaded_skill_hashes: dict[str, str] = {}
-    if skill_loader:
+    explicitly_allowed_skill_names: set[str] = set()
+    if skill_loader is not None:
+        from box_agent.tools.skill_catalog_tool import ListSkillsTool
         from box_agent.tools.skill_tool import GetSkillTool
 
         tools = [
-            GetSkillTool(
+            (ListSkillsTool if isinstance(tool, ListSkillsTool) else GetSkillTool)(
                 skill_loader,
-                preloaded_skill_hashes=cli_preloaded_skill_hashes,
+                include_disabled=tool.include_disabled,
+                allowed_skill_names=tool.allowed_skill_names,
+                blocked_skill_names=tool.blocked_skill_names,
+                explicitly_allowed_skill_names=explicitly_allowed_skill_names,
             )
-            if isinstance(tool, GetSkillTool)
-            else tool
+            if isinstance(tool, (GetSkillTool, ListSkillsTool)) else tool
             for tool in tools
         ]
-
     # 4. Add workspace-dependent tools
     non_interactive = task is not None
     allow_full_access = config.tools.allow_full_access
@@ -2185,6 +2183,7 @@ async def run_agent(
         llm_client=llm_client,
         system_prompt=system_prompt,
         tools=tools,
+        skill_runtime=SkillRuntime(skill_loader) if skill_loader is not None else None,
         max_steps=config.agent.max_steps,
         tool_limits=config.tool_limits,
         workspace_dir=str(workspace_dir),
@@ -2242,7 +2241,6 @@ async def run_agent(
             _set_agent_system_prompt(relocated_prompt)
         skill_selector = SkillSelector(skill_loader)
         skill_selector.bind(agent.messages[0].content)
-    cli_preloaded_skill_names: list[str] = []
 
     def _sync_cli_cache_fingerprint_context() -> None:
         sync_skill_cache_fingerprint_context(
@@ -2252,7 +2250,7 @@ async def run_agent(
                 if skill_selector is not None
                 else None
             ),
-            preloaded_skill_names=cli_preloaded_skill_names,
+            preloaded_skill_names=(),
         )
 
     def _apply_skill_filter(user_input: str) -> tuple[str, ...]:
@@ -2265,47 +2263,14 @@ async def run_agent(
         _sync_cli_cache_fingerprint_context()
         return skill_selector.matched_skill_names
 
-    def _apply_cli_auto_loaded_skills(user_input: str) -> None:
-        if skill_loader is None or skill_selector is None:
-            _sync_cli_cache_fingerprint_context()
-            return
-        explicit_skill = resolve_explicit_skill_invocation(skill_loader, user_input)
-        preload_names = turn_preload_skill_names(
-            skill_selector.matched_skill_names,
-            cli_env_context,
-            user_input,
-            selected_skill_names=(
-                (explicit_skill.name,)
-                if explicit_skill is not None
-                else ()
-            ),
-        )
-        if not preload_names and not cli_preloaded_skill_names:
-            _sync_cli_cache_fingerprint_context()
-            return
-        result, unloaded_skill_names = prepare_auto_loaded_skills(
-            skill_loader,
-            agent.system_prompt,
-            preload_names,
-            preloaded_skill_names=cli_preloaded_skill_names,
-            preloaded_skill_hashes=cli_preloaded_skill_hashes,
-            prompt_builder=build_auto_loaded_skills_prompt,
-        )
+    def _select_cli_skills(user_input: str) -> None:
+        explicit = resolve_explicit_skill_invocation(skill_loader, user_input)
+        explicitly_allowed_skill_names.clear()
+        if explicit is not None:
+            explicitly_allowed_skill_names.add(explicit.name)
+        if agent.skill_runtime is not None:
+            agent.skill_runtime.select((explicit.name,) if explicit else ())
         _sync_cli_cache_fingerprint_context()
-        for missing_name in result.missing_names:
-            print(f"{Colors.YELLOW}⚠️  Skill preload target not found: {missing_name}{Colors.RESET}")
-        if result.changed:
-            _set_agent_system_prompt(result.system_prompt)
-        if unloaded_skill_names:
-            print(
-                f"{Colors.DIM}Auto-unloaded skills: "
-                f"{', '.join(sorted(unloaded_skill_names))}{Colors.RESET}"
-            )
-        if result.loaded_names and result.changed:
-            print(
-                f"{Colors.DIM}Auto-loaded skills: "
-                f"{', '.join(result.loaded_names)}{Colors.RESET}"
-            )
 
     async def _refresh_mcp_after_auth_change() -> None:
         results = await reconnect_auth_failed_mcp_servers_if_token_changed()
@@ -2367,7 +2332,7 @@ async def run_agent(
             register_mcp_tools(agent.tools, loaded_mcp_tools)
         await _refresh_mcp_after_auth_change()
         _apply_skill_filter(task)
-        _apply_cli_auto_loaded_skills(task)
+        _select_cli_skills(task)
         user_source_text = bind_user_source_text(agent.tools, user_source_text, task)
         agent.add_user_message(task)
         ok = True
@@ -2713,7 +2678,7 @@ async def run_agent(
                 f"{Colors.DIM}Thinking... (Esc to cancel){Colors.RESET}\n"
             )
             _apply_skill_filter(user_input)
-            _apply_cli_auto_loaded_skills(user_input)
+            _select_cli_skills(user_input)
             user_source_text = bind_user_source_text(
                 agent.tools, user_source_text, user_input
             )

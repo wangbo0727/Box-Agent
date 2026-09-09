@@ -796,3 +796,12 @@ def _is_compaction_metadata(msg: Message) -> bool:
             _WORKFLOW_CHECKPOINT_MARKER,
         )
     )
+
+
+def skill_reference_budget_chars(messages: list[Message], tools: Any, token_limit: int,
+                                 output_tokens: int = 0) -> int:
+    """Reserve the next real request, including tool schemas and image estimates."""
+    tool_map = tools if isinstance(tools, dict) else {tool.name: tool for tool in (tools or ())}
+    estimated, _ = _estimate_context_from_latest_response(messages, tool_map)
+    spare_tokens = max(0, token_limit - estimated - max(1024, output_tokens))
+    return min(50_000, spare_tokens * 4)

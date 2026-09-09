@@ -147,6 +147,7 @@ class ToolEngine:
         if event_queue is not None:
             context = ToolInvocationContext(
                 event_queue=event_queue,
+                skill_reader=context.skill_reader if context is not None else None,
                 parent_tool_call_id=(
                     context.parent_tool_call_id
                     if context is not None

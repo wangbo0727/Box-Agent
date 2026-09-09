@@ -525,7 +525,7 @@ class ActiveSkillTool(Tool):
 
 
 @pytest.mark.asyncio
-async def test_get_skill_moves_full_instructions_to_system_prompt() -> None:
+async def test_get_skill_keeps_full_instructions_in_tool_result() -> None:
     messages = _msgs()
     llm = CapturingStreamLLM(
         [
@@ -561,11 +561,71 @@ async def test_get_skill_moves_full_instructions_to_system_prompt() -> None:
     tool_message = next(message for message in second_request if message.role == "tool")
     result_event = next(event for event in events if isinstance(event, ToolCallResult))
 
-    assert "## Active Skill Instructions" in system_message.content
-    assert "MANDATORY_SKILL_RULE" in system_message.content
-    assert "MANDATORY_SKILL_RULE" not in tool_message.content
-    assert "loaded into active system instructions" in tool_message.content
+    assert "## Active Skill Instructions" not in system_message.content
+    assert "MANDATORY_SKILL_RULE" not in system_message.content
+    assert "MANDATORY_SKILL_RULE" in tool_message.content
+    assert "loaded into active system instructions" not in tool_message.content
     assert "MANDATORY_SKILL_RULE" in result_event.content
+
+
+@pytest.mark.asyncio
+async def test_selected_skill_is_reference_on_each_step_and_real_tool_read_reuses_it(tmp_path):
+    from box_agent.skill_runtime import SkillRuntime
+    from box_agent.tools.skill_loader import SkillLoader
+    from box_agent.tools.skill_tool import GetSkillTool
+
+    root = tmp_path / "demo"
+    root.mkdir()
+    (root / "SKILL.md").write_text("---\nname: demo\ndescription: demo\n---\nREAL_SKILL_BODY\n")
+    loader = SkillLoader(sources=[(tmp_path, "user")])
+    loader.discover_skills()
+    runtime = SkillRuntime(loader)
+    runtime.select(["demo"])
+    messages = _msgs()
+    original_user = messages[-1].content
+    llm = CapturingStreamLLM([
+        LLMResponse(content="", tool_calls=[ToolCall(id="read_demo", type="function",
+            function=FunctionCall(name="get_skill", arguments={"skill_name": "demo"}))], finish_reason="tool"),
+        LLMResponse(content="done", finish_reason="stop"),
+    ])
+    await collect(run_agent_loop(llm=llm, messages=messages, tools={"get_skill": GetSkillTool(loader)},
+                                 skill_engine=runtime, max_steps=3))
+    assert len(llm.message_calls) == 2
+    for request in llm.message_calls:
+        assert "REAL_SKILL_BODY" not in request[0].content
+        assert sum(str(m.content).count("REAL_SKILL_BODY") for m in request) == 1
+    assert messages[1].content == original_user
+    assert "reuse" in next(m.content for m in messages if m.role == "tool")
+    assert all(m.request_only_input_tokens > 0 for m in messages if m.role == "assistant")
+
+
+@pytest.mark.asyncio
+async def test_multiple_skill_results_share_next_request_budget(tmp_path):
+    from box_agent.kernel.context_engine import _fallback_context_estimate
+    from box_agent.tools.skill_loader import SkillLoader
+    from box_agent.tools.skill_tool import GetSkillTool
+
+    for name in ("first", "second"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: method\n---\n" + (f"{name} useful instructions " * 4 + "\n") * 140
+        )
+    loader = SkillLoader(sources=[(tmp_path, "user")])
+    loader.discover_skills()
+    tool = GetSkillTool(loader)
+    llm = CapturingStreamLLM([
+        LLMResponse(content="", tool_calls=[ToolCall(id=name, type="function", function=FunctionCall(
+            name="get_skill", arguments={"skill_name": name})) for name in ("first", "second")], finish_reason="tool"),
+        LLMResponse(content="done", finish_reason="stop"),
+    ])
+    messages = _msgs()
+    await collect(run_agent_loop(llm=llm, messages=messages, tools={tool.name: tool}, max_steps=3, token_limit=9000))
+    results = [message for message in messages if message.role == "tool"]
+    assert len(results) == 2
+    assert all("[Skill reference]" in message.content for message in results)
+    assert '"has_more": true' in results[1].content
+    assert _fallback_context_estimate(llm.message_calls[1], {tool.name: tool}) + 1024 <= 9000
 
 
 class ChunkedStreamLLM:

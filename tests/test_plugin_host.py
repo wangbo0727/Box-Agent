@@ -11,7 +11,7 @@ import pytest
 
 from box_agent.events import ContentEvent
 from box_agent.schema import LLMResponse, Message, StreamEvent
-from box_agent.tools.base import Tool
+from box_agent.tools.base import Tool, ToolResult
 
 
 SERVICE_OWNED_RUN_ARGUMENTS = frozenset(
@@ -26,6 +26,7 @@ SERVICE_OWNED_RUN_ARGUMENTS = frozenset(
         "session_log",
         "tool_exposure_manager",
         "tool_result_storage",
+        "skill_engine",
     }
 )
 
@@ -150,6 +151,21 @@ class _ToolCatalog(dict[str, Tool]):
     pass
 
 
+class _SkillProjection:
+    def __init__(self, messages):
+        self.messages = messages
+        self.references = ()
+        self.input_tokens = 0
+
+
+class _SkillEngine:
+    def read(self, name, *, budget_chars=None, **kwargs):
+        return ToolResult(success=True, content=name)
+
+    def prepare_context(self, messages, *, budget_chars):
+        return _SkillProjection(messages)
+
+
 class _ExposureOutcome:
     def __init__(self, tools: list[Tool]) -> None:
         self.tools = tools
@@ -218,6 +234,8 @@ def test_current_capability_shapes_satisfy_kernel_ports() -> None:
         MemoryPromotionPort,
         PermissionGatewayPort,
         SessionStorePort,
+        SkillContextPort,
+        SkillEnginePort,
         SummaryLLMPort,
         ToolCatalogPort,
         ToolExposureResultPort,
@@ -239,6 +257,21 @@ def test_current_capability_shapes_satisfy_kernel_ports() -> None:
     assert isinstance(_ExposureOutcome([]), ToolExposureResultPort)
     assert isinstance(_ToolResultStore(), ToolResultStorePort)
     assert isinstance(_BudgetOutcome(), ToolResultBudgetOutcomePort)
+    assert isinstance(_SkillEngine(), SkillEnginePort)
+    assert isinstance(_SkillEngine().prepare_context([], budget_chars=100), SkillContextPort)
+
+
+def test_skill_port_declares_projection_shape_and_read_budget() -> None:
+    from typing import get_type_hints
+    from box_agent.kernel.ports import SkillContextPort, SkillEnginePort
+    from box_agent.skill_runtime import SkillRuntime
+
+    assert get_type_hints(SkillEnginePort.prepare_context)["return"] is SkillContextPort
+    parameters = inspect.signature(SkillEnginePort.read).parameters
+    assert parameters["budget_chars"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["budget_chars"].default is None
+    inspect.signature(SkillRuntime.read).bind(None, "shared", budget_chars=100)
+    assert isinstance(SkillRuntime(None).prepare_context([], budget_chars=100), SkillContextPort)
 
 
 def test_production_defaults_match_port_call_shapes() -> None:
@@ -416,7 +449,7 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
 
     bindings = DEFAULT_CAPABILITY_SCHEMA.bindings
 
-    from box_agent.kernel.ports import ToolEnginePort
+    from box_agent.kernel.ports import SkillEnginePort, ToolEnginePort
 
     ports_by_field = {
         "llm": LLMPort,
@@ -431,6 +464,7 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
         "tool_exposure": ToolExposurePort,
         "tool_result_store": ToolResultStorePort,
         "tool_engine": ToolEnginePort,
+        "skill_engine": SkillEnginePort,
     }
     assert tuple(binding.port_type for binding in bindings) == tuple(
         ports_by_field[field.name] for field in fields(KernelServices)

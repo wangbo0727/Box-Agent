@@ -14,6 +14,7 @@ from .plugins.defaults import (
     compose_default_services,
     create_default_plugin_host,
     kernel_services_from_registry,
+    skill_loader_from_catalog,
 )
 from .plugins.host import PluginActivation, PluginCleanupError, PluginHost
 
@@ -30,6 +31,7 @@ _SERVICE_OWNED_RUN_ARGUMENTS = frozenset(
         "session_log",
         "tool_exposure_manager",
         "tool_result_storage",
+        "skill_engine",
     }
 )
 
@@ -38,6 +40,16 @@ def _default_capabilities(run_arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Translate legacy run arguments without copying capability instances."""
 
     memory_manager = run_arguments.get("memory_manager")
+    skill_engine = run_arguments.get("skill_engine")
+    if skill_engine is None:
+        from .skill_runtime import SkillRuntime
+        loader = skill_loader_from_catalog(run_arguments["tools"])
+        if loader is not None:
+            skill_engine = SkillRuntime(
+                loader,
+                session_log=run_arguments.get("session_log"),
+                messages=run_arguments.get("messages"),
+            )
     return {
         "llm": run_arguments["llm"],
         "summary_llm": run_arguments.get("summary_llm"),
@@ -54,6 +66,7 @@ def _default_capabilities(run_arguments: Mapping[str, Any]) -> dict[str, Any]:
         "tool_catalog": run_arguments["tools"],
         "tool_exposure": run_arguments.get("tool_exposure_manager"),
         "tool_result_store": run_arguments.get("tool_result_storage"),
+        "skill_engine": skill_engine,
     }
 
 

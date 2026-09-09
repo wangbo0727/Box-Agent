@@ -387,7 +387,7 @@ def test_cli_ctrl_d_exits_without_empty_error(
     assert "❌ Error:" not in output
 
 
-def test_interactive_cli_preloads_explicit_skill_without_completion_gate(
+def test_interactive_cli_delivers_explicit_skill_as_ordinary_reference(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -431,18 +431,24 @@ def test_interactive_cli_preloads_explicit_skill_without_completion_gate(
         ),
     )
     run_options: list[dict[str, object]] = []
+    real_run = cli.Agent.run
 
     async def fake_initialize_base_tools(*args, **kwargs):
-        return [GetSkillTool(skill_loader)], skill_loader, None, None
+        from box_agent.tools.skill_catalog_tool import ListSkillsTool
+        return [GetSkillTool(skill_loader, blocked_skill_names={"report-skill"}),
+                ListSkillsTool(skill_loader, blocked_skill_names={"report-skill"})], skill_loader, None, None
 
     async def fake_run(self, *args, **kwargs):
+        catalog = await self.tools["list_skills"].execute(query="report-skill")
+        assert catalog.raw_output["skills"][0]["available"]
+        assert "report-skill" in self.tools["get_skill"].explicitly_allowed_skill_names
         run_options.append(
             {
                 "kwargs": kwargs,
                 "system_prompt": self.messages[0].content,
             }
         )
-        return "done"
+        return await real_run(self, *args, **kwargs)
 
     monkeypatch.setattr(
         cli.Config,
@@ -463,6 +469,7 @@ def test_interactive_cli_preloads_explicit_skill_without_completion_gate(
     monkeypatch.setattr(cli, "PromptSession", _ExplicitSkillPromptSession)
     monkeypatch.setattr(cli.Agent, "run", fake_run)
     _ExplicitSkillPromptSession.prompt_count = 0
+    _CaptureStreamLLM.instances.clear()
 
     exit_code = asyncio.run(
         cli.run_agent(
@@ -476,7 +483,12 @@ def test_interactive_cli_preloads_explicit_skill_without_completion_gate(
     assert exit_code == 0
     assert len(run_options) == 1
     assert "completion_gate" not in run_options[0]["kwargs"]
-    assert "Generate the requested report." in run_options[0]["system_prompt"]
+    assert "Generate the requested report." not in run_options[0]["system_prompt"]
+    snapshot = _CaptureStreamLLM.instances[0].message_snapshots[0]
+    assert any(role == "user" and "Generate the requested report." in str(content)
+               for role, content in snapshot)
+    assert all("Generate the requested report." not in str(content)
+               for role, content in snapshot if role in ("system", "developer"))
 
 
 def test_cli_workspace_tools_receive_self_managed_node_runtime(
@@ -627,7 +639,7 @@ def test_cli_uses_saved_code_workspace_mode(tmp_path: Path, monkeypatch) -> None
     assert "Do not create or use an `output/` folder" in system_prompt
 
 
-def test_cli_task_preloads_pptx_even_when_filter_drops_it(tmp_path: Path, monkeypatch) -> None:
+def test_cli_task_reads_pptx_on_demand_without_automatic_fulltext(tmp_path: Path, monkeypatch) -> None:
     skills_dir = tmp_path / "skills"
     prompt = "做一份 12 页新员工入职培训 PPT，1920×1080 可编辑"
     for index in range(16):
@@ -715,19 +727,15 @@ def test_cli_task_preloads_pptx_even_when_filter_drops_it(tmp_path: Path, monkey
 
     assert exit_code == 0
     first_system_prompt = _CaptureStreamLLM.instances[0].system_prompts[0]
-    assert "## Auto-Loaded Skill Instructions" in first_system_prompt
-    assert "# Skill: pptx" in first_system_prompt
-    assert "# PPTX FULL RULES" in first_system_prompt
-    assert "# Skill: html-templates" in first_system_prompt
-    assert "# HTML TEMPLATE RULES" in first_system_prompt
+    assert "## Auto-Loaded Skill Instructions" not in first_system_prompt
+    assert "# PPTX FULL RULES" not in first_system_prompt
+    assert "# HTML TEMPLATE RULES" not in first_system_prompt
     snapshots = _CaptureStreamLLM.instances[0].message_snapshots
     assert len(snapshots) == 2
     tool_messages = [content for role, content in snapshots[1] if role == "tool"]
-    assert tool_messages == [
-        "Skill 'pptx' is already preloaded in this session. "
-        "Follow its system instructions directly."
-    ]
-    assert "# PPTX FULL RULES" not in tool_messages[0]
+    assert len(tool_messages) == 1
+    assert "# PPTX FULL RULES" in tool_messages[0]
+    assert "# HTML TEMPLATE RULES" not in tool_messages[0]
 
 
 def test_cli_task_returns_failure_for_done_error(

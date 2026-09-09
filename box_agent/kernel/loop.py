@@ -716,6 +716,7 @@ async def _run_agent_loop_impl(
     tools = _services.tool_catalog
     tool_exposure_manager = _services.tool_exposure
     tool_result_storage = _services.tool_result_store
+    skill_engine = _services.skill_engine
 
     cancelled = is_cancelled or (lambda: False)
     # Capture before memory, repair and continuation messages can change history.
@@ -926,6 +927,29 @@ async def _run_agent_loop_impl(
     )
     pending_transient_followup_blocks: list[dict[str, Any]] = []
     pending_transient_followup_tokens = 0
+    skill_request_tokens = 0
+    request_context_messages: list[Message] = []
+    tool_list: list[Any] = []
+
+    def read_skill(name: str, **arguments: Any) -> Any:
+        from .context_engine import skill_reference_budget_chars
+
+        # Recompute after the assistant's tool-call arguments have been added.
+        # The reader also deducts earlier results from this serial tool batch.
+        output_budget = getattr(llm, "max_output_tokens", 0)
+        calls = next((message.tool_calls for message in reversed(messages)
+                      if message.role == "assistant" and message.tool_calls), ())
+        committed = {message.tool_call_id for message in messages if message.role == "tool"}
+        envelopes = [Message(role="tool", name=call.function.name, tool_call_id=call.id, content="")
+                     for call in calls if call.id not in committed]
+        available = skill_reference_budget_chars(
+            [*messages, *envelopes, *request_context_messages], tool_list, token_limit,
+            output_budget if isinstance(output_budget, int) else 0,
+        )
+        assert skill_engine is not None
+        return skill_engine.read(name, **arguments, budget_chars=max(
+            0, available - (skill_request_tokens + pending_transient_followup_tokens) * 4,
+        ))
 
     # Per-turn guard for tools that can be repeatedly requested by the model
     # after it already has enough evidence. Once a budget is reached, later
@@ -949,6 +973,7 @@ async def _run_agent_loop_impl(
             session_id=session_id, turn_id=turn_id,
             permission_negotiator=permission_negotiator, logger=logger,
             resource_ledger=resource_ledger, activate_skill=active_skill_activator,
+            skill_reader=read_skill if skill_engine is not None else None,
         ),
         ToolExecutionOptions(
             tool_call_limits=tool_call_limits, max_tool_calls=max_tool_calls,
@@ -1274,6 +1299,22 @@ async def _run_agent_loop_impl(
             if request_context_messages
             else messages
         )
+        skill_references = ()
+        skill_request_tokens = 0
+        if skill_engine is not None:
+            from .context_engine import skill_reference_budget_chars
+            full_request = [*request_messages, transient_message] if transient_message is not None else request_messages
+            output_budget = getattr(llm, "max_output_tokens", 0)
+            projection = skill_engine.prepare_context(
+                request_messages,
+                budget_chars=skill_reference_budget_chars(
+                    full_request, tool_list, token_limit,
+                    output_budget if isinstance(output_budget, int) else 0,
+                ),
+            )
+            request_messages = projection.messages
+            skill_references = projection.references
+            skill_request_tokens = projection.input_tokens
         provider_request_messages = (
             [*request_messages, transient_message]
             if transient_message is not None
@@ -1319,6 +1360,7 @@ async def _run_agent_loop_impl(
                     "provider": request_provider,
                     "model": request_model,
                     "tokenLimit": token_limit,
+                    "skillReferences": list(skill_references),
                     **(
                         {
                             "autoMemoryContext": {
@@ -1388,7 +1430,7 @@ async def _run_agent_loop_impl(
                 pending_transient_followup_tokens
                 if transient_message is not None
                 else 0
-            )
+            ) + skill_request_tokens
             llm_stream = llm.generate_stream(**stream_kwargs)
             async for chunk in _stream_with_activity(
                 llm_stream,

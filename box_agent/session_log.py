@@ -7,7 +7,10 @@ import hashlib
 import json
 import logging
 import os
+import re
+import tempfile
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -382,6 +385,104 @@ class SessionLog:
         except OSError as exc:
             self._failed = True
             raise SessionLogDurabilityError("session log flush failed") from exc
+
+    def _skill_reference_path(self, ref: Mapping[str, Any]) -> Path:
+        """Accept only a content-addressed file in this session's namespace."""
+
+        digest = ref.get("sha256") if isinstance(ref, Mapping) else None
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SessionLogCorrupted("invalid Skill reference hash")
+        expected = f"skill-references/{digest}.txt"
+        if ref.get("contentRef") != expected:
+            raise SessionLogCorrupted("invalid Skill reference path")
+        path = self.path.parent / expected
+        if path.parent.is_symlink() or path.is_symlink():
+            raise SessionLogCorrupted("Skill reference paths must not be symbolic links")
+        if path.resolve().parent != (self.path.parent.resolve() / "skill-references"):
+            raise SessionLogCorrupted("Skill reference escapes the session directory")
+        return path
+
+    def read_skill_reference(self, ref: Mapping[str, Any]) -> str:
+        """Read an exact UTF-8 snapshot, validating its path and byte hash."""
+
+        path = self._skill_reference_path(ref)
+        try:
+            if not path.is_file():
+                raise SessionLogCorrupted(
+                    "cannot read missing or non-regular Skill reference snapshot"
+                )
+            content = path.read_bytes()
+        except OSError as exc:
+            raise SessionLogCorrupted("cannot read Skill reference snapshot") from exc
+        if hashlib.sha256(content).hexdigest() != ref["sha256"]:
+            raise SessionLogCorrupted("Skill reference content hash mismatch")
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SessionLogCorrupted("Skill reference is not valid UTF-8") from exc
+
+    def store_skill_reference(self, content: str) -> dict[str, str]:
+        """Durably publish an immutable snapshot without appending an event.
+
+        After this succeeds, callers append the returned reference plus its
+        request/range metadata to ``request/context`` and flush that event
+        before calling the provider. Neither a trace nor the original Skill
+        file is needed to reconstruct that request's reference text.
+        """
+
+        if self._closed:
+            raise RuntimeError("session log is closed")
+        if self._failed:
+            raise SessionLogDurabilityError("session log is unusable after an I/O failure")
+        encoded = content.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        ref = {"contentRef": f"skill-references/{digest}.txt", "sha256": digest}
+        path = self._skill_reference_path(ref)
+        temporary: Path | None = None
+        try:
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            if path.exists():
+                # Never overwrite a corrupt snapshot or change an existing
+                # inode. Re-sync a valid file before acknowledging reuse.
+                self.read_skill_reference(ref)
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            else:
+                fd, name = tempfile.mkstemp(prefix=".skill-reference-", dir=path.parent)
+                temporary = Path(name)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    # Linking publishes an already-fsynced inode atomically
+                    # without replacing any snapshot that appeared meanwhile.
+                    os.link(temporary, path)
+                except FileExistsError:
+                    self.read_skill_reference(ref)
+                    with path.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                temporary.unlink()
+                temporary = None
+            if os.name != "nt":
+                # Persist both the snapshot name and the newly-created
+                # namespace. Windows does not support opening directory fds.
+                for directory in (path.parent, self.path.parent):
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+        except OSError as exc:
+            self._failed = True
+            raise SessionLogDurabilityError("Skill reference persistence failed") from exc
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return ref
 
     def append_unlogged_messages(
         self,

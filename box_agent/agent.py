@@ -8,7 +8,6 @@ giving adapters one stable entry point for configuring and running a turn.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import sys
@@ -53,7 +52,8 @@ from .tools.mcp_tool_search import (
     MCPToolExposureManager,
     ToolSearchTool,
 )
-from .tools.skill_preload import build_active_skills_prompt
+from .skill_runtime import SkillRuntime
+from .skill_state import SkillSessionState
 from .tool_result_storage import ToolResultStorage
 from .cli_renderer import CliRenderer, Colors, _format_size
 from .session_continuation import ContinuationMessage
@@ -458,6 +458,7 @@ class Agent:
         tool_limits: ToolLimitsConfig | None = None,
         deferred_mcp_loading_enabled: bool = True,
         session_log: SessionLog | None = None,
+        skill_runtime: SkillRuntime | None = None,
     ):
         self.llm = llm_client
         self.tools = {
@@ -482,7 +483,7 @@ class Agent:
         self.local_tool_exposure = LocalToolExposurePolicy(
             lambda: self.tools,
             goal_provider=lambda: getattr(self, "goal", None),
-            active_skills_provider=lambda: getattr(self, "_active_skill_prompts", {}),
+            active_skills_provider=lambda: self.skill_runtime.active_names,
         )
         # Eager MCP remains eager. Its local discovery uses an isolated empty
         # catalog so a process-global deferred server cannot leak into this mode.
@@ -559,10 +560,10 @@ class Agent:
             )
 
         self.system_prompt = system_prompt
-        self._active_skill_prompts: dict[str, str] = {}
-        self._active_skill_hashes: dict[str, str] = {}
-        self._active_skill_load_order: dict[str, int] = {}
-        self._active_skill_sequence = 0
+        loader = next((getattr(tool, "skill_loader", None) for tool in self.tools.values()
+                       if getattr(tool, "skill_loader", None) is not None), None)
+        self.skill_runtime = skill_runtime or SkillRuntime(loader, session_log=session_log)
+        self.skill_runtime.session_log = session_log
         for tool in self.tools.values():
             if hasattr(tool, "set_parent_system_prompt"):
                 tool.set_parent_system_prompt(system_prompt)
@@ -596,6 +597,8 @@ class Agent:
             if callable(configure_todos):
                 configure_todos(self.session_log, projection.todos)
             self.restored_skills = projection.skills
+            if self.restored_skills and self.skill_runtime.loader is not None:
+                self.skill_runtime.restore_records(self.restored_skills)
         else:
             self.restored_skills = []
 
@@ -648,133 +651,53 @@ class Agent:
         return self.mcp_tool_exposure.inherited_tools(self.tools)
 
     def set_system_prompt(self, system_prompt: str) -> None:
-        """Update the live system prompt while preserving active skills."""
-        rendered_prompt = build_active_skills_prompt(
-            system_prompt,
-            self._active_skill_prompts,
-        )
-        self.system_prompt = rendered_prompt
+        """Replace system rules; Skill reference text is projected separately."""
+        self.system_prompt = system_prompt
         if self.messages and self.messages[0].role == "system":
-            self.messages[0] = Message(role="system", content=rendered_prompt)
+            self.messages[0] = Message(role="system", content=system_prompt)
         for tool in self.tools.values():
             if hasattr(tool, "set_parent_system_prompt"):
-                tool.set_parent_system_prompt(rendered_prompt)
+                tool.set_parent_system_prompt(system_prompt)
 
     def activate_skill_instructions(self, skill_name: str, skill_prompt: str) -> None:
-        """Pin an on-demand skill in the managed system-prompt tail block."""
-        normalized_name = skill_name.strip()
-        if not normalized_name or not skill_prompt.strip():
-            return
-        prompt_hash = hashlib.sha256(skill_prompt.encode("utf-8")).hexdigest()
-        if self._active_skill_hashes.get(normalized_name) == prompt_hash:
-            return
-        self._active_skill_prompts[normalized_name] = skill_prompt
-        self._active_skill_hashes[normalized_name] = prompt_hash
-        self._active_skill_sequence += 1
-        self._active_skill_load_order[normalized_name] = self._active_skill_sequence
-        self.set_system_prompt(self.system_prompt)
-        self._persist_active_skills()
-        diagnostics = self.active_skill_diagnostics()
-        if diagnostics["budget_exceeded"]:
-            _log.warning(
-                "active skill prompt budget exceeded: names=%s estimated_tokens=%d budget=%d; "
-                "instructions were preserved without silent truncation",
-                diagnostics["names"],
-                diagnostics["estimated_tokens"],
-                diagnostics["token_budget"],
-            )
+        """Deprecated host API: select ordinary reference material for this turn."""
+        if skill_name.strip() and skill_prompt.strip():
+            self.skill_runtime.register_reference(skill_name.strip(), skill_prompt)
 
     def deactivate_skill_instructions(self, skill_name: str) -> bool:
-        """Explicitly remove one on-demand skill from the managed prompt tail."""
-        normalized_name = skill_name.strip()
-        if normalized_name not in self._active_skill_prompts:
-            return False
-        del self._active_skill_prompts[normalized_name]
-        self._active_skill_hashes.pop(normalized_name, None)
-        self._active_skill_load_order.pop(normalized_name, None)
-        self.set_system_prompt(self.system_prompt)
-        self._persist_active_skills()
-        return True
+        name = skill_name.strip()
+        removed = self.skill_runtime.state.reads.pop(name, None) is not None
+        self.skill_runtime.select([item for item in self.skill_runtime.state.selected if item != name])
+        if removed:
+            self._persist_active_skills()
+        return removed
 
     def clear_active_skill_instructions(self) -> None:
-        """Clear on-demand skills at an explicit task/session boundary."""
-        if not self._active_skill_prompts:
-            return
-        self._active_skill_prompts.clear()
-        self._active_skill_hashes.clear()
-        self._active_skill_load_order.clear()
-        self.set_system_prompt(self.system_prompt)
+        self.skill_runtime.state = SkillSessionState()
         self._persist_active_skills()
 
     def _persist_active_skills(self) -> None:
-        if self.session_log is None:
-            return
-        ordered = sorted(
-            self._active_skill_prompts,
-            key=lambda name: self._active_skill_load_order[name],
-        )
-        self.session_log.append(
-            "skill/change",
-            {
-                "skills": [
-                    {
-                        "name": name,
-                        "sha256": self._active_skill_hashes[name],
-                        "loadOrder": self._active_skill_load_order[name],
-                    }
-                    for name in ordered
-                ]
-            },
-        )
-        self.session_log.flush()
+        if self.session_log is not None:
+            self.session_log.append("skill/change", {"skills": self.skill_runtime.log_records()})
+            self.session_log.flush()
 
-    def restore_active_skill_instructions(
-        self,
-        skills: list[tuple[str, str, str, int]],
-    ) -> None:
-        """Restore current Skill prompts without enforcing historical content hashes."""
-
-        restored_prompts: dict[str, str] = {}
-        restored_hashes: dict[str, str] = {}
-        restored_order: dict[str, int] = {}
-        for name, prompt, _prompt_hash, load_order in sorted(
-            skills,
-            key=lambda item: item[3],
-        ):
-            actual_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            restored_prompts[name] = prompt
-            restored_hashes[name] = actual_hash
-            restored_order[name] = load_order
-        self._active_skill_prompts = restored_prompts
-        self._active_skill_hashes = restored_hashes
-        self._active_skill_load_order = restored_order
-        self._active_skill_sequence = max(
-            self._active_skill_load_order.values(),
-            default=0,
-        )
-        self.set_system_prompt(self.system_prompt)
+    def restore_active_skill_instructions(self, skills: list[tuple[str, str, str, int]]) -> None:
+        """Restore current valid references; historical hashes remain provenance."""
+        self.skill_runtime.restore_records([
+            {"name": name, "prompt": prompt, "sha256": historical_hash, "loadOrder": order}
+            for name, prompt, historical_hash, order in skills
+        ])
 
     def active_skill_diagnostics(self) -> dict[str, object]:
-        """Return metadata-only prompt budget diagnostics (never skill text)."""
-        ordered_names = tuple(
-            sorted(
-                self._active_skill_prompts,
-                key=lambda name: self._active_skill_load_order.get(name, 0),
-            )
-        )
-        estimated_tokens = sum(
-            max(1, len(self._active_skill_prompts[name]) // 4)
-            for name in ordered_names
-        )
-        return {
-            "names": ordered_names,
-            "hashes": tuple(
-                (name, self._active_skill_hashes[name]) for name in ordered_names
-            ),
-            "estimated_tokens": estimated_tokens,
-            "token_budget": _ACTIVE_SKILL_TOKEN_BUDGET,
-            "budget_exceeded": estimated_tokens > _ACTIVE_SKILL_TOKEN_BUDGET,
-        }
+        """Return metadata for effective references without exposing their bodies."""
+        valid = set(self.skill_runtime.active_names)
+        records = [item for item in sorted(self.skill_runtime.state.reads.values(), key=lambda item: item.order)
+                   if item.name in valid]
+        estimated = sum(max(1, len(item.prompt) // 4) for item in records)
+        return {"names": tuple(item.name for item in records),
+                "hashes": tuple((item.name, item.revision) for item in records),
+                "estimated_tokens": estimated, "token_budget": _ACTIVE_SKILL_TOKEN_BUDGET,
+                "budget_exceeded": estimated > _ACTIVE_SKILL_TOKEN_BUDGET}
 
     def add_user_message(self, content: str):
         """Add a user message to history."""
@@ -1002,6 +925,7 @@ class Agent:
         with host-specific services should pass ``AgentRunOptions`` instead of
         calling the low-level core loop.
         """
+        self.skill_runtime.begin_turn()
         effective_options = options or self.default_run_options()
 
         if cancel_event is not None:
@@ -1095,7 +1019,7 @@ class Agent:
             artifact_root_dir=effective_options.artifact_root_dir,
             cache_fingerprint_context=effective_options.cache_fingerprint_context,
             cache_fingerprint_sink=effective_options.cache_fingerprint_sink,
-            active_skill_activator=self.activate_skill_instructions,
+            skill_engine=self.skill_runtime,
             current_turn_text=effective_options.current_turn_text,
             context_resource_ledger=self.context_resource_ledger,
             context_resource_dedup_enabled=self.context_resource_dedup_enabled,
