@@ -193,3 +193,55 @@ async def test_permission_result_is_committed_once_without_inline_image_bytes(tm
         assert image_data not in log.path.read_text()
     finally:
         log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_system", [False, True])
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_direct_loop_persists_each_result_once_with_or_without_system(tmp_path, with_system, parallel):
+    from box_agent.session_log import SessionLog
+
+    class Echo(Tool):
+        name = "echo"
+        description = "Return the fixture value."
+        parameters = {"type": "object", "properties": {"value": {"type": "string"}}}
+        parallel_safe = parallel
+
+        async def execute(self, value):
+            return ToolResult(success=True, content=value, raw_output={"value": value})
+
+    class TwoSteps:
+        step = 0
+
+        async def generate_stream(self, messages, tools=None, **kwargs):
+            self.step += 1
+            if self.step <= 2:
+                yield StreamEvent(type="finish", finish_reason="tool_use", tool_calls=[
+                    ToolCall(id=f"echo-{self.step}", type="function", function=FunctionCall(
+                        name="echo", arguments={"value": f"value-{self.step}"},
+                    )),
+                ])
+            else:
+                yield StreamEvent(type="text", delta="Done.")
+                yield StreamEvent(type="finish", finish_reason="stop")
+
+    messages = [Message(role="user", content="Echo two values.")]
+    if with_system:
+        messages.insert(0, Message(role="system", content="Fixture system."))
+    log = SessionLog.create(tmp_path / "sessions", session_id="direct-loop", cwd=tmp_path)
+    try:
+        events = [event async for event in run_agent_loop(
+            llm=TwoSteps(), tools={"echo": Echo()}, messages=messages,
+            session_log=log, session_turn=1, max_steps=4,
+        )]
+        results = [event for event in events if isinstance(event, ToolCallResult)]
+        calls = [event for event in log.events if event["type"] == "tool/call"]
+        stored = [event for event in log.events if event["type"] == "tool/result"]
+        assert len(results) == len(calls) == len(stored) == 2
+        assert [event["data"]["message"]["tool_call_id"] for event in stored] == ["echo-1", "echo-2"]
+        for index, event in enumerate(stored, 1):
+            assert event["data"]["result"]["success"] is True
+            assert event["data"]["result"]["rawOutput"] == {"value": f"value-{index}"}
+        assert log.replay().messages == (messages[1:] if with_system else messages)
+    finally:
+        log.close()

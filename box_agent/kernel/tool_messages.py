@@ -12,6 +12,11 @@ if TYPE_CHECKING:
     from ..tools.engine.call_contracts import ToolCallRecord
 
 
+def session_log_messages(messages: list[Message]) -> list[Message]:
+    """Use the same durable conversation at request, response and tool commits."""
+    return messages[1:] if messages and messages[0].role == "system" else messages
+
+
 class ToolMessageCommitter:
     def __init__(self, messages: list[Message], session_log: SessionStorePort | None, turn: int | None):
         self.messages = messages
@@ -42,9 +47,8 @@ class ToolMessageCommitter:
         self.messages.append(message)
         if self.session_log is None or self.turn is None:
             return
-        surface = self.messages[1:] if self.messages and self.messages[0].role == "system" else self.messages
         self.session_log.append_unlogged_messages(
-            surface, turn=self.turn, step=step,
+            session_log_messages(self.messages), turn=self.turn, step=step,
             tool_result_metadata={event.tool_call_id: {
                 "success": event.success, "content": event.content,
                 "error": event.error, "rawOutput": event.raw_output,
