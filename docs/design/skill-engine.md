@@ -1,6 +1,6 @@
 # Skill、Tool 与 Context：发现、读取与请求资料
 
-本 PR 将 Skill 统一为可发现、可按需读取的方法资料，并按职责分工：**Skill 管来源、选择与读取事实，Tool 管工具曝光、调用与权限，Context 管下一次模型输入中的正文位置、可见范围和预算，Kernel 管执行顺序与真实历史。** 目录名称和简介仍由 `SkillLoader.get_skills_metadata_prompt` 生成，经 CLI/ACP 现有 system 模板插入；Context 组装读取正文和宿主资料的位置、可见范围与预算。正文通过真实 `get_skill` 结果或宿主选择后的普通资料块交付，不再因固定名称或关键词命中而自动写入 system。
+本 PR 将 Skill 统一为可发现、可按需读取的方法资料，并按职责分工：**Skill 管来源、选择与读取事实，Tool 管工具曝光、调用与权限，Context 管主 Agent 下一次模型输入中的正文位置、可见范围和预算，Kernel 管执行顺序与真实历史。** 目录名称和简介仍由 `SkillLoader.get_skills_metadata_prompt` 生成，经 CLI/ACP 现有 system 模板插入；Context 组装主请求中的读取正文和宿主资料。子任务明确委派的方法资料包仍由子任务入口组装，见第 7 节。因此当前不是所有 Skill 相关拼装都已统一到 Context。正文不再因固定名称或关键词命中而自动写入 system。
 
 本文说明当前源码的实现与兼容边界，不代表已发布或安装的运行时。测试入口列在文末；具体执行结果、目标提交和真实任务验证由本 PR 的最终验证报告分别记录。[Tool 重构文档](tool-refactor/design.md)保留其历史上下文，Skill 的当前行为以本文和源码为准。
 
@@ -102,7 +102,7 @@ Agent 持有一个 `SkillRuntime`，每次 run 借用同一服务。共享 Loade
 
 ## 7. 子 Agent 的明确委派
 
-子任务继续使用原平面参数与严格 `required_tools` 合同。明确分配的 Skill 展开 required 闭包，全文由 child system 移至子任务 user 参考资料；没有读取工具的 child 仍可获得预算内的完整明确资料包。此路径不属于关键词触发的自动预加载，也不增加工具授权。
+子任务继续使用原平面参数与严格 `required_tools` 合同。`sub_agent_tool.py` 的 `_explicit_messages` 将任务和明确委派的方法组装成子任务输入，`_bounded_explicit_messages` 检查整体预算；这部分仍在子任务入口，没有迁入 `DefaultContextEngine`。明确分配的 Skill 展开 required 闭包，全文由 child system 移至子任务 user 参考资料；没有读取工具的 child 仍可获得预算内的完整明确资料包。此路径不属于关键词触发的自动预加载，也不增加工具授权。
 
 已授予 child 的 Get/List 使用独立实例，只允许分配闭包中的名称，保留父任务实际的 profile 禁止项与用户显式例外。代读正文同样检查这些限制，不能绕过禁用策略。子 Agent 不对任意父 system 文本按 Skill 标题做粗切割；正常 Agent 提供无 Skill 正文的 system。
 

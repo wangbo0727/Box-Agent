@@ -232,7 +232,10 @@ def _assert_schema_contract(tools, profile, *, child_read_tools=()):
     expected["get_skill"]["schema"]["description"] = (
         "Read a Skill's method and resource paths. Follow next_offset with the returned revision "
         "when paged. Read required_skills before their steps; related_skills are optional. "
-        "Skill guidance does not grant tools or permission. Use list_skills for names and availability."
+        "Skill guidance does not grant tools or permission. Use list_skills for names and availability. "
+        "When using a Skill, follow its applicable workflow, required reference files and verification, "
+        "consistent with the user request and permissions. If a required step is blocked, use an "
+        "available permitted recovery or report it as incomplete; do not treat required steps as optional."
     )
     expected["get_skill"]["schema"]["input_schema"]["additionalProperties"] = False
     expected["get_skill"]["schema"]["input_schema"]["properties"].update({
