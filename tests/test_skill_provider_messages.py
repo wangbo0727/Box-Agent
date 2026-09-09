@@ -11,6 +11,7 @@ import pytest
 from box_agent.llm.anthropic_client import AnthropicClient
 from box_agent.llm.openai_client import OpenAIClient
 from box_agent.schema import FunctionCall, Message, ToolCall
+from box_agent.skill_context import SkillReferenceContext
 from box_agent.skill_runtime import SkillRuntime
 from box_agent.tools.base import ToolInvocationContext, build_tool_name_index
 from box_agent.tools.skill_loader import SkillLoader
@@ -24,7 +25,7 @@ PROVIDERS = [pytest.param(OpenAIClient, id="openai"), pytest.param(AnthropicClie
 
 
 @pytest.fixture
-def disk_runtime(tmp_path):
+def disk_context(tmp_path):
     for name, body in (("selected-guide", HOST_BODY), ("read-guide", TOOL_BODY)):
         path = tmp_path / "skills" / name / "SKILL.md"
         path.parent.mkdir(parents=True)
@@ -44,7 +45,7 @@ def disk_runtime(tmp_path):
          "data": base64.b64encode(image_path.read_bytes()).decode("ascii")},
         {"type": "text", "text": f"Attachment: {note_path}\n{note_path.read_text(encoding='utf-8')}"},
     ]
-    return runtime, blocks
+    return SkillReferenceContext(runtime), blocks
 
 
 def convert(provider, messages):
@@ -83,13 +84,13 @@ def assert_attachments_survive(provider, wire):
 
 
 @pytest.mark.parametrize("provider", PROVIDERS)
-def test_explicit_selection_serializes_as_ordinary_reference_without_fake_tool_result(disk_runtime, provider):
-    runtime, blocks = disk_runtime
+def test_explicit_selection_serializes_as_ordinary_reference_without_fake_tool_result(disk_context, provider):
+    context, blocks = disk_context
     messages = [Message(role="system", content="BASE_POLICY"), Message(role="user", content=blocks)]
     before = [message.model_dump() for message in messages]
 
-    context = runtime.prepare_context(messages, budget_chars=50000)
-    system, wire = convert(provider, context.messages)
+    projection = context.prepare_request(messages, budget_chars=50000)
+    system, wire = convert(provider, projection.messages)
 
     assert_reference_locations(system, wire)
     assert_attachments_survive(provider, wire)
@@ -106,16 +107,16 @@ def test_explicit_selection_serializes_as_ordinary_reference_without_fake_tool_r
 
 @pytest.mark.parametrize("provider", PROVIDERS)
 @pytest.mark.parametrize("call_name", ["get_skill", "skill_view"])
-async def test_real_skill_tool_result_keeps_call_id_beside_ordinary_attachment_reference(disk_runtime, provider, call_name):
-    runtime, blocks = disk_runtime
+async def test_real_skill_tool_result_keeps_call_id_beside_ordinary_attachment_reference(disk_context, provider, call_name):
+    context, blocks = disk_context
     messages = [Message(role="system", content="BASE_POLICY"), Message(role="user", content="Read the method first.")]
-    runtime.prepare_context(messages, budget_chars=50000)
+    context.prepare_request(messages, budget_chars=50000)
     call_id = "skill-call-42"
     call = ToolCall(id=call_id, type="function",
                     function=FunctionCall(name=call_name, arguments={"skill_name": "read-guide"}))
-    tool = build_tool_name_index([GetSkillTool(runtime.loader)])[call_name]
+    tool = build_tool_name_index([GetSkillTool(context.runtime.loader)])[call_name]
     result = await tool.invoke(call.function.arguments, context=ToolInvocationContext(
-        parent_tool_call_id=call_id, skill_reader=runtime.read,
+        parent_tool_call_id=call_id, skill_reader=context.read,
     ))
     assert result.success and TOOL_BODY in result.model_context
     messages.extend([
@@ -125,8 +126,8 @@ async def test_real_skill_tool_result_keeps_call_id_beside_ordinary_attachment_r
     ])
     before = [message.model_dump() for message in messages]
 
-    context = runtime.prepare_context(messages, budget_chars=50000)
-    system, wire = convert(provider, context.messages)
+    projection = context.prepare_request(messages, budget_chars=50000)
+    system, wire = convert(provider, projection.messages)
 
     assert_reference_locations(system, wire)
     assert_attachments_survive(provider, wire)

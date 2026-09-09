@@ -716,7 +716,9 @@ async def _run_agent_loop_impl(
     tools = _services.tool_catalog
     tool_exposure_manager = _services.tool_exposure
     tool_result_storage = _services.tool_result_store
-    skill_engine = _services.skill_engine
+    context_engine = _services.context_engine
+    if context_engine is not None:
+        context_engine.bind_history(messages)
 
     cancelled = is_cancelled or (lambda: False)
     # Capture before memory, repair and continuation messages can change history.
@@ -927,29 +929,9 @@ async def _run_agent_loop_impl(
     )
     pending_transient_followup_blocks: list[dict[str, Any]] = []
     pending_transient_followup_tokens = 0
-    skill_request_tokens = 0
+    request_overlay_tokens = 0
     request_context_messages: list[Message] = []
     tool_list: list[Any] = []
-
-    def read_skill(name: str, **arguments: Any) -> Any:
-        from .context_engine import skill_reference_budget_chars
-
-        # Recompute after the assistant's tool-call arguments have been added.
-        # The reader also deducts earlier results from this serial tool batch.
-        output_budget = getattr(llm, "max_output_tokens", 0)
-        calls = next((message.tool_calls for message in reversed(messages)
-                      if message.role == "assistant" and message.tool_calls), ())
-        committed = {message.tool_call_id for message in messages if message.role == "tool"}
-        envelopes = [Message(role="tool", name=call.function.name, tool_call_id=call.id, content="")
-                     for call in calls if call.id not in committed]
-        available = skill_reference_budget_chars(
-            [*messages, *envelopes, *request_context_messages], tool_list, token_limit,
-            output_budget if isinstance(output_budget, int) else 0,
-        )
-        assert skill_engine is not None
-        return skill_engine.read(name, **arguments, budget_chars=max(
-            0, available - (skill_request_tokens + pending_transient_followup_tokens) * 4,
-        ))
 
     # Per-turn guard for tools that can be repeatedly requested by the model
     # after it already has enough evidence. Once a budget is reached, later
@@ -958,22 +940,29 @@ async def _run_agent_loop_impl(
     tool_engine = _services.tool_engine
     assert tool_engine is not None
     tool_messages = ToolMessageCommitter(messages, session_log, session_turn)
+
+    def validate_followup(result, tool, pending):
+        accepted, blocks, tokens = _validate_transient_followup_result(
+            result=result, tool=tool, llm=llm, token_limit=token_limit,
+            pending_token_estimate=pending,
+        )
+        if blocks and context_engine is not None:
+            context_engine.reserve_followup(blocks)
+        return accepted, blocks, tokens
+
     tool_engine.configure_run(
         ToolRunContext(
             messages=messages, hooks=hook_mgr, result_storage=result_storage,
             is_cancelled=cancelled, record_call=tool_messages.record_call,
             flush_calls=tool_messages.flush_calls,
             commit_result=tool_messages.commit_result,
-            validate_followup=lambda result, tool, pending: _validate_transient_followup_result(
-                result=result, tool=tool, llm=llm, token_limit=token_limit,
-                pending_token_estimate=pending,
-            ),
+            validate_followup=validate_followup,
             policy_error=browser_intent_policy.tool_call_error,
             workspace_dir=workspace_dir, artifact_root_dir=artifact_root_dir,
             session_id=session_id, turn_id=turn_id,
             permission_negotiator=permission_negotiator, logger=logger,
             resource_ledger=resource_ledger, activate_skill=active_skill_activator,
-            skill_reader=read_skill if skill_engine is not None else None,
+            skill_reader=context_engine.tool_reader if context_engine is not None else None,
         ),
         ToolExecutionOptions(
             tool_call_limits=tool_call_limits, max_tool_calls=max_tool_calls,
@@ -1294,32 +1283,34 @@ async def _run_agent_loop_impl(
             for message in (auto_memory_context_message,)
             if message is not None
         ]
-        request_messages = (
-            [*messages, *request_context_messages]
-            if request_context_messages
-            else messages
-        )
+        request_overlay_tokens = pending_transient_followup_tokens if transient_message is not None else 0
         skill_references = ()
-        skill_request_tokens = 0
-        if skill_engine is not None:
-            from .context_engine import skill_reference_budget_chars
-            full_request = [*request_messages, transient_message] if transient_message is not None else request_messages
+        if context_engine is not None:
             output_budget = getattr(llm, "max_output_tokens", 0)
-            projection = skill_engine.prepare_context(
-                request_messages,
-                budget_chars=skill_reference_budget_chars(
-                    full_request, tool_list, token_limit,
-                    output_budget if isinstance(output_budget, int) else 0,
-                ),
+            projection = context_engine.prepare_request(
+                messages, prepared_tools=prepared_tools, token_limit=token_limit,
+                output_tokens=output_budget if isinstance(output_budget, int) else 0,
+                extra_messages=tuple(request_context_messages),
+                transient_message=transient_message,
+                transient_tokens=pending_transient_followup_tokens,
             )
-            request_messages = projection.messages
+            if projection.blocked_reason:
+                msg = projection.blocked_reason
+                if hook_mgr.hooks:
+                    await hook_mgr.fire_error(message=msg, is_fatal=True, exception=None)
+                    await hook_mgr.fire_done(stop_reason=StopReason.ERROR, final_content=msg)
+                yield ErrorEvent(message=msg, is_fatal=True)
+                yield DoneEvent(stop_reason=StopReason.ERROR, final_content=msg)
+                return
+            request_messages = projection.context_messages
+            provider_request_messages = projection.messages
             skill_references = projection.references
-            skill_request_tokens = projection.input_tokens
-        provider_request_messages = (
-            [*request_messages, transient_message]
-            if transient_message is not None
-            else request_messages
-        )
+            request_overlay_tokens = projection.request_only_input_tokens
+        else:
+            # Legacy manually constructed service bundles may omit Context.
+            request_messages = [*messages, *request_context_messages]
+            provider_request_messages = ([*request_messages, transient_message]
+                                         if transient_message is not None else request_messages)
 
         if session_log is not None and session_turn is not None:
             request_provider = getattr(llm, "provider", None)
@@ -1426,11 +1417,7 @@ async def _run_agent_loop_impl(
             }
             if call_kind:
                 stream_kwargs["call_kind"] = call_kind
-            request_only_input_tokens = (
-                pending_transient_followup_tokens
-                if transient_message is not None
-                else 0
-            ) + skill_request_tokens
+            request_only_input_tokens = request_overlay_tokens
             llm_stream = llm.generate_stream(**stream_kwargs)
             async for chunk in _stream_with_activity(
                 llm_stream,

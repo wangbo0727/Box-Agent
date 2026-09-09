@@ -48,7 +48,6 @@ def _default_capabilities(run_arguments: Mapping[str, Any]) -> dict[str, Any]:
             skill_engine = SkillRuntime(
                 loader,
                 session_log=run_arguments.get("session_log"),
-                messages=run_arguments.get("messages"),
             )
     return {
         "llm": run_arguments["llm"],
@@ -89,6 +88,8 @@ def compose_default_kernel_services(
     from .tools.engine.engine import DefaultToolEngine
 
     services = compose_default_services(**_default_capabilities(run_arguments))
+    if services.context_engine is not None:
+        services.context_engine.bind_history(run_arguments.get("messages") or [])
     return replace(
         services,
         tool_engine=DefaultToolEngine(
@@ -193,6 +194,8 @@ async def run_agent_loop_with_default_services(
     try:
         activation = await host.activate()
         services = kernel_services_from_registry(activation.registry)
+        if services.context_engine is not None:
+            services.context_engine.bind_history(run_arguments.get("messages") or [])
         kernel = AgentLoopKernel(
             _services=services,
             _runtime_defaults=runtime_defaults,

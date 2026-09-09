@@ -15,6 +15,7 @@ from ..kernel.ports import (
     ToolCatalogPort,
     ToolEnginePort,
     SkillEnginePort,
+    ContextEnginePort,
     ToolExposurePort,
     ToolResultStorePort,
 )
@@ -43,6 +44,7 @@ DEFAULT_CAPABILITY_SCHEMA = CapabilitySchema(
         CapabilityBinding(ToolResultStorePort, CapabilityPolicy.OPTIONAL_SINGLE),
         CapabilityBinding(ToolEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
         CapabilityBinding(SkillEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
+        CapabilityBinding(ContextEnginePort, CapabilityPolicy.OPTIONAL_SINGLE),
     )
 )
 
@@ -109,6 +111,7 @@ def default_plugin_descriptors(
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
     skill_engine: SkillEnginePort | None = None,
+    context_engine: ContextEnginePort | None = None,
 ) -> tuple[PluginDescriptor, ...]:
     """Return deterministic descriptors for the supplied runtime instances."""
 
@@ -141,12 +144,22 @@ def default_plugin_descriptors(
         ),
         ("default.tool-engine", ToolEnginePort, tool_engine, True),
         ("default.skill-engine", SkillEnginePort, skill_engine, True),
+        ("default.context-engine", ContextEnginePort, context_engine, True),
     )
-    return tuple(
+    descriptors = tuple(
         _captured_instance_descriptor(plugin_id, port_type, instance)
         for plugin_id, port_type, instance, optional in capabilities
         if not optional or instance is not None
     )
+    if context_engine is None:
+        from ..context_input import DefaultContextEngine
+
+        descriptors += (PluginDescriptor(
+            plugin_id="default.context-engine", version="1.0.0",
+            capabilities=(ContextEnginePort,), factory=DefaultContextEngine,
+            scope=PluginScope.RUN,
+        ),)
+    return descriptors
 
 
 def create_default_plugin_host(
@@ -164,6 +177,7 @@ def create_default_plugin_host(
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
     skill_engine: SkillEnginePort | None = None,
+    context_engine: ContextEnginePort | None = None,
 ) -> PluginHost:
     """Create a fresh static host for one outer agent-loop run."""
 
@@ -182,6 +196,7 @@ def create_default_plugin_host(
             tool_result_store=tool_result_store,
             tool_engine=tool_engine,
             skill_engine=skill_engine,
+            context_engine=context_engine,
         ),
         schema=DEFAULT_CAPABILITY_SCHEMA,
     )
@@ -191,6 +206,10 @@ def kernel_services_from_registry(registry: ActivatedRegistry) -> KernelServices
     """Map one immutable activated registry to the kernel's immutable bundle."""
 
     _validate_skill_source(registry.require(ToolCatalogPort), registry.get(SkillEnginePort))
+    context_engine = registry.get(ContextEnginePort)
+    if context_engine is not None:
+        context_engine.configure_run(skill_engine=registry.get(SkillEnginePort),
+                                     session_store=registry.get(SessionStorePort))
     return KernelServices(
         llm=registry.require(LLMPort),
         summary_llm=registry.get(SummaryLLMPort),
@@ -205,6 +224,7 @@ def kernel_services_from_registry(registry: ActivatedRegistry) -> KernelServices
         tool_result_store=registry.get(ToolResultStorePort),
         tool_engine=registry.get(ToolEnginePort),
         skill_engine=registry.get(SkillEnginePort),
+        context_engine=context_engine,
     )
 
 
@@ -223,10 +243,16 @@ def compose_default_services(
     tool_result_store: ToolResultStorePort | None,
     tool_engine: ToolEnginePort | None = None,
     skill_engine: SkillEnginePort | None = None,
+    context_engine: ContextEnginePort | None = None,
 ) -> KernelServices:
-    """Return one immutable bundle without discovery, I/O, or object creation."""
+    """Resolve a run-local Context over borrowed services without discovery or I/O."""
 
     _validate_skill_source(tool_catalog, skill_engine)
+    if context_engine is None:
+        from ..context_input import DefaultContextEngine
+
+        context_engine = DefaultContextEngine()
+    context_engine.configure_run(skill_engine=skill_engine, session_store=session_store)
     return KernelServices(
         llm=llm,
         summary_llm=summary_llm,
@@ -241,6 +267,7 @@ def compose_default_services(
         tool_result_store=tool_result_store,
         tool_engine=tool_engine,
         skill_engine=skill_engine,
+        context_engine=context_engine,
     )
 
 

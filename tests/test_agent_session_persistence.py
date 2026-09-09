@@ -660,12 +660,26 @@ def test_legacy_restore_api_uses_configured_loader_instead_of_supplied_historica
 
 async def test_new_skill_reference_log_is_readable_by_pr1_projection(tmp_path):
     current_root = Path(__file__).resolve().parents[1]
-    legacy_root = Path(os.environ.get("BOX_AGENT_LEGACY_WORKTREE", current_root.with_name("box-agent-tool-refactor")))
-    if not (legacy_root / "box_agent" / "session_log.py").is_file():
-        pytest.skip("Set BOX_AGENT_LEGACY_WORKTREE to the original PR1 checkout for cross-version replay")
-    legacy_sha = subprocess.run(["git", "-C", str(legacy_root), "rev-parse", "HEAD"],
-                                check=True, capture_output=True, text=True).stdout.strip()
-    assert legacy_sha == "3e83bb3b287e244dd1a2887fd4bc14be2eb19e32"
+    legacy_sha = "3e83bb3b287e244dd1a2887fd4bc14be2eb19e32"
+    configured = os.environ.get("BOX_AGENT_LEGACY_WORKTREE")
+    legacy_root = Path(configured) if configured else tmp_path / "legacy-reader"
+    if configured:
+        actual_sha = subprocess.run(["git", "-C", str(legacy_root), "rev-parse", "HEAD"],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+        assert actual_sha == legacy_sha
+    else:
+        # Load the actual old reader and its schema from fixed Git objects.
+        # An empty package initializer avoids importing unrelated old Agent
+        # code; none of the reader/schema implementation is substituted.
+        for path in ("box_agent/session_log.py", "box_agent/schema/__init__.py", "box_agent/schema/schema.py"):
+            original = subprocess.run(["git", "-C", str(current_root), "show", f"{legacy_sha}:{path}"],
+                                      capture_output=True, timeout=10)
+            if original.returncode:
+                pytest.skip("Legacy Git objects unavailable; supply BOX_AGENT_LEGACY_WORKTREE for cross-version replay")
+            destination = legacy_root / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(original.stdout)
+        (legacy_root / "box_agent" / "__init__.py").write_text("", encoding="utf-8")
     loader = _make_reference_loader(tmp_path)
     root = tmp_path / "sessions"
     log = SessionLog.create(root, session_id="new-skill-old-reader", cwd=tmp_path)

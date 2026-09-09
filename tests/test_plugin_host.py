@@ -151,19 +151,21 @@ class _ToolCatalog(dict[str, Tool]):
     pass
 
 
-class _SkillProjection:
-    def __init__(self, messages):
-        self.messages = messages
-        self.references = ()
-        self.input_tokens = 0
-
-
 class _SkillEngine:
-    def read(self, name, *, budget_chars=None, **kwargs):
-        return ToolResult(success=True, content=name)
+    read_facts = ()
+    selected_names = ()
+    restoring_names = ()
+    restore_diagnostics = {}
+    legacy_system_suffix = ""
 
-    def prepare_context(self, messages, *, budget_chars):
-        return _SkillProjection(messages)
+    def resolve_reference(self, name):
+        return name
+
+    def record_delivery(self, snapshot, metadata, *, reason):
+        pass
+
+    def record_observation(self, snapshot, metadata):
+        pass
 
 
 class _ExposureOutcome:
@@ -234,7 +236,8 @@ def test_current_capability_shapes_satisfy_kernel_ports() -> None:
         MemoryPromotionPort,
         PermissionGatewayPort,
         SessionStorePort,
-        SkillContextPort,
+        PreparedContextPort,
+        ContextEnginePort,
         SkillEnginePort,
         SummaryLLMPort,
         ToolCatalogPort,
@@ -258,20 +261,24 @@ def test_current_capability_shapes_satisfy_kernel_ports() -> None:
     assert isinstance(_ToolResultStore(), ToolResultStorePort)
     assert isinstance(_BudgetOutcome(), ToolResultBudgetOutcomePort)
     assert isinstance(_SkillEngine(), SkillEnginePort)
-    assert isinstance(_SkillEngine().prepare_context([], budget_chars=100), SkillContextPort)
+    from box_agent.context_input import DefaultContextEngine, PreparedContext
+
+    assert isinstance(DefaultContextEngine(), ContextEnginePort)
+    assert isinstance(PreparedContext([], []), PreparedContextPort)
 
 
-def test_skill_port_declares_projection_shape_and_read_budget() -> None:
+def test_context_port_owns_projection_and_skill_port_exposes_source_facts() -> None:
     from typing import get_type_hints
-    from box_agent.kernel.ports import SkillContextPort, SkillEnginePort
+    from box_agent.kernel.ports import ContextEnginePort, PreparedContextPort, SkillEnginePort
+    from box_agent.tools.engine.contracts import PreparedTools
     from box_agent.skill_runtime import SkillRuntime
 
-    assert get_type_hints(SkillEnginePort.prepare_context)["return"] is SkillContextPort
-    parameters = inspect.signature(SkillEnginePort.read).parameters
-    assert parameters["budget_chars"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["budget_chars"].default is None
+    assert get_type_hints(ContextEnginePort.prepare_request, localns={"PreparedTools": PreparedTools})["return"] is PreparedContextPort
+    assert "prepare_context" not in vars(SkillEnginePort)
+    assert "messages" not in inspect.signature(SkillRuntime).parameters
+    assert "resolve_reference" in vars(SkillEnginePort)
+    assert "record_delivery" in vars(SkillEnginePort)
     inspect.signature(SkillRuntime.read).bind(None, "shared", budget_chars=100)
-    assert isinstance(SkillRuntime(None).prepare_context([], budget_chars=100), SkillContextPort)
 
 
 def test_production_defaults_match_port_call_shapes() -> None:
@@ -449,7 +456,7 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
 
     bindings = DEFAULT_CAPABILITY_SCHEMA.bindings
 
-    from box_agent.kernel.ports import SkillEnginePort, ToolEnginePort
+    from box_agent.kernel.ports import ContextEnginePort, SkillEnginePort, ToolEnginePort
 
     ports_by_field = {
         "llm": LLMPort,
@@ -465,6 +472,7 @@ def test_default_capability_schema_covers_kernel_services_in_field_order() -> No
         "tool_result_store": ToolResultStorePort,
         "tool_engine": ToolEnginePort,
         "skill_engine": SkillEnginePort,
+        "context_engine": ContextEnginePort,
     }
     assert tuple(binding.port_type for binding in bindings) == tuple(
         ports_by_field[field.name] for field in fields(KernelServices)
@@ -530,7 +538,13 @@ def test_default_descriptors_are_deterministic_and_preserve_exact_instances() ->
     assert by_port[MemoryLookupPort] is memory
     assert by_port[MemoryPromotionPort] is memory
     assert by_port[ToolCatalogPort] is tools
-    assert len(first) == 6
+    from box_agent.context_input import DefaultContextEngine
+    from box_agent.kernel.ports import ContextEnginePort
+
+    assert isinstance(by_port[ContextEnginePort], DefaultContextEngine)
+    context_descriptor = next(item for item in first if item.capabilities == (ContextEnginePort,))
+    assert inspect.signature(context_descriptor.factory).parameters == {}
+    assert len(first) == 7
 
 
 @pytest.mark.asyncio

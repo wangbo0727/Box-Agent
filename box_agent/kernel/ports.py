@@ -304,17 +304,20 @@ class ToolEnginePort(Protocol):
 
 
 @runtime_checkable
-class SkillContextPort(Protocol):
-    """Request projection fields consumed by the kernel after Skill preparation."""
+class PreparedContextPort(Protocol):
+    """Request-only projection consumed by Kernel without domain inspection."""
 
     messages: list[Message]
+    context_messages: list[Message]
     references: tuple[dict[str, Any], ...]
     input_tokens: int
+    request_only_input_tokens: int
+    blocked_reason: str | None
 
 
 @runtime_checkable
 class SkillEnginePort(Protocol):
-    """Borrowed session service for Skill reads and ordinary input references.
+    """Borrowed session source and delivery facts, without request ownership.
 
     The outer assembly verifies source compatibility with its Skill tools;
     the kernel consumes this behavior without discovering or rebinding sources.
@@ -322,9 +325,47 @@ class SkillEnginePort(Protocol):
     match theirs; custom tool implementations own their binding contract.
     """
 
-    def read(self, name: str, *, budget_chars: int | None = None, **kwargs: Any) -> ToolResult: ...
+    @property
+    def read_facts(self) -> tuple[Any, ...]: ...
 
-    def prepare_context(self, messages: list[Message], *, budget_chars: int) -> SkillContextPort: ...
+    @property
+    def selected_names(self) -> tuple[str, ...]: ...
+
+    @property
+    def restoring_names(self) -> tuple[str, ...]: ...
+
+    @property
+    def restore_diagnostics(self) -> dict[str, str]: ...
+
+    @property
+    def legacy_system_suffix(self) -> str: ...
+
+    def resolve_reference(self, name: str) -> Any: ...
+
+    def record_delivery(self, snapshot: Any, metadata: dict[str, Any], *, reason: str) -> None: ...
+
+    def record_observation(self, snapshot: Any, metadata: dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class ContextEnginePort(Protocol):
+    """Run-owned input projection over final resolved session capabilities."""
+
+    def configure_run(self, *, skill_engine: SkillEnginePort | None = None,
+                      session_store: SessionStorePort | None = None) -> None: ...
+
+    def bind_history(self, messages: list[Message]) -> None: ...
+
+    def reserve_followup(self, blocks: list[dict[str, Any]]) -> None: ...
+
+    @property
+    def tool_reader(self) -> Callable[..., ToolResult] | None: ...
+
+    def prepare_request(self, messages: list[Message], *, prepared_tools: PreparedTools,
+                        token_limit: int, output_tokens: int = 0,
+                        extra_messages: tuple[Message, ...] = (),
+                        transient_message: Message | None = None,
+                        transient_tokens: int = 0) -> PreparedContextPort: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,10 +385,12 @@ class KernelServices:
     tool_result_store: ToolResultStorePort | None
     tool_engine: ToolEnginePort | None = None
     skill_engine: SkillEnginePort | None = None
+    context_engine: ContextEnginePort | None = None
 
 
 __all__ = [
-    "SkillContextPort",
+    "PreparedContextPort",
+    "ContextEnginePort",
     "SkillEnginePort",
     "HookBusPort",
     "KernelServices",

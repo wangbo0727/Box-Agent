@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .schema import Message
+import json
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,11 +30,27 @@ class SkillRead:
 
 
 @dataclass(frozen=True, slots=True)
-class SkillContext:
-    messages: list[Message]
-    references: tuple[dict[str, Any], ...] = ()
-    diagnostics: tuple[str, ...] = ()
-    input_tokens: int = 0
+class SkillReferenceSnapshot:
+    """Immutable effective-source data; resolving it does not imply delivery."""
+
+    name: str
+    source: str
+    path: str
+    revision: str
+    prompt: str
+    metadata_json: str
+
+    @property
+    def skill_path(self) -> Path | None:
+        return Path(self.path) if self.path else None
+
+    def to_prompt(self) -> str:
+        return self.prompt
+
+    def reference_metadata(self, *, offset: int, reason: str) -> dict[str, Any]:
+        metadata = json.loads(self.metadata_json)
+        metadata.update(offset=offset, end_offset=offset, reason=reason)
+        return metadata
 
 
 @dataclass(slots=True)

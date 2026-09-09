@@ -1,4 +1,4 @@
-"""Session Skill discovery, bounded reading and ordinary-context projection."""
+"""Session Skill sources, selection and durable delivery facts."""
 
 from __future__ import annotations
 
@@ -7,10 +7,8 @@ from typing import Any
 from hashlib import sha256
 from types import SimpleNamespace
 
-from .schema import Message
-from .skill_context import append_reference, read_reference, render_reference, visible_ranges, reference_cost
 from .skill_dependencies import SkillDependencyError, resolve_required_skills
-from .skill_state import SkillContext, SkillRead, SkillSessionState
+from .skill_state import SkillReferenceSnapshot, SkillRead, SkillSessionState
 from .tools.base import ToolResult
 
 from box_agent.tools.skill_loader import SkillLoader
@@ -21,24 +19,17 @@ from box_agent.tools.skill_preload import (
 
 
 class SkillRuntime:
-    """Borrow the loader; own only this session's facts and current references."""
+    """Borrow the loader; own source validity, selection and delivery facts."""
 
-    def __init__(self, loader: SkillLoader | None, *, session_log: Any = None,
-                 messages: list[Message] | None = None):
+    def __init__(self, loader: SkillLoader | None, *, session_log: Any = None):
         self.loader = loader
         self.session_log = session_log
         self.state = SkillSessionState()
-        self._messages: list[Message] = []
-        self._remaining = 50_000
-        self._host_visible: dict[str, str] = {}
         self.turn_deliveries: dict[str, dict[str, Any]] = {}
-        self.reference_overhead_chars = 0
         self._restore_pending: tuple[str, ...] = ()
         self._restoring: tuple[str, ...] = ()
         self._restore_diagnostics: dict[str, str] = {}
         self._legacy_system_suffix = ""
-        if messages:
-            self._observe_reads(messages)
 
     def begin_turn(self) -> None:
         self.turn_deliveries.clear()
@@ -172,42 +163,72 @@ class SkillRuntime:
     def log_records(self) -> list[dict[str, Any]]:
         return [read.log_record() for read in sorted(self.state.reads.values(), key=lambda r: r.order)]
 
-    def _observe_reads(self, messages: list[Message]) -> None:
-        """Recover facts from real, source-verified tool text for messages-only callers."""
-        for message in messages:
-            if (message.role != "tool" or message.name not in {"get_skill", "skill_view"}
-                    or not message.tool_call_id or not isinstance(message.content, str)):
-                continue
-            parsed = read_reference(message.content)
-            if parsed is None:
-                continue
-            metadata, _ = parsed
-            name = metadata.get("name")
-            if not isinstance(name, str):
-                continue
+    @property
+    def read_facts(self) -> tuple[SkillRead, ...]:
+        return tuple(self.state.reads.values())
+
+    @property
+    def selected_names(self) -> tuple[str, ...]:
+        return self.state.selected
+
+    @property
+    def restoring_names(self) -> tuple[str, ...]:
+        return self._restoring
+
+    @property
+    def restore_diagnostics(self) -> dict[str, str]:
+        return dict(self._restore_diagnostics)
+
+    @property
+    def legacy_system_suffix(self) -> str:
+        return self._legacy_system_suffix
+
+    def resolve_reference(self, name: str) -> SkillReferenceSnapshot:
+        """Validate the effective source and return data without recording a read."""
+        import json
+
+        if self.loader is not None:
+            self.loader.maybe_reload()
+        skill = self._resolve(name.strip())
+        prompt = skill.to_prompt()
+        digest = getattr(skill, "instruction_digest", None)
+        if digest and skill.skill_path:
             try:
-                skill = self._resolve(name)
-            except SkillDependencyError:
-                continue
-            prompt = skill.to_prompt()
-            revision = sha256(prompt.encode()).hexdigest()
-            lines = prompt.splitlines(keepends=True)
-            if (metadata.get("source") != skill.source
-                    or metadata.get("path") != str(skill.skill_path or "")
-                    or not visible_ranges([message], name=name, revision=revision, lines=lines)):
-                continue
-            old = self.state.reads.get(name)
-            ranges = set(old.delivered_ranges) if old and old.revision == revision else set()
-            pair = (metadata["offset"], metadata["end_offset"])
-            if pair in ranges:
-                continue
-            ranges.add(pair)
-            self.state.sequence += 1
-            self.state.reads[name] = SkillRead(
-                name, skill.source, str(skill.skill_path or ""), revision, prompt,
-                self.state.sequence, "history", tuple(sorted(ranges)),
-                len({line for start, end in ranges for line in range(start, end)}) == len(lines),
-            )
+                if sha256(skill.skill_path.read_bytes()).hexdigest() != digest:
+                    raise SkillDependencyError("SKILL_SOURCE_CHANGED", "Skill source changed during reading. Refresh and retry from offset=0.")
+            except OSError as exc:
+                raise SkillDependencyError("SKILL_SOURCE_UNAVAILABLE", f"Skill source became unreadable: {exc}") from exc
+        metadata = self._metadata(skill, prompt, offset=0, reason="tool")
+        return SkillReferenceSnapshot(skill.name, skill.source, str(skill.skill_path or ""),
+                                      metadata["revision"], prompt, json.dumps(metadata, ensure_ascii=False))
+
+    def record_delivery(self, snapshot: SkillReferenceSnapshot, metadata: dict[str, Any], *, reason: str) -> None:
+        """Record returned material; this says nothing about current visibility."""
+        if reason != "restored" and not metadata.get("reused"):
+            self._remember(snapshot, snapshot.prompt, reason, metadata)
+        self.turn_deliveries[snapshot.name] = dict(metadata)
+
+    def record_observation(self, snapshot: SkillReferenceSnapshot, metadata: dict[str, Any]) -> None:
+        """Recover validated historical delivery facts without rewriting logs."""
+        old = self.state.reads.get(snapshot.name)
+        ranges = set(old.delivered_ranges) if (old and old.revision == snapshot.revision
+                  and old.source == snapshot.source and old.path == snapshot.path) else set()
+        pair = (metadata["offset"], metadata["end_offset"])
+        if pair in ranges:
+            return
+        ranges.add(pair)
+        self.state.sequence += 1
+        self.state.reads[snapshot.name] = SkillRead(
+            snapshot.name, snapshot.source, snapshot.path, snapshot.revision, snapshot.prompt,
+            self.state.sequence, "history", tuple(sorted(ranges)),
+            len({line for start, end in ranges for line in range(start, end)}) == len(snapshot.prompt.splitlines()),
+        )
+
+    def read(self, name: str, **kwargs: Any) -> ToolResult:
+        """Standalone compatibility read; request state belongs to its Context."""
+        from .skill_context import SkillReferenceContext
+
+        return SkillReferenceContext(self).read(name, **kwargs)
 
     def _metadata(self, skill: Any, prompt: str, *, offset: int, reason: str) -> dict[str, Any]:
         metadata = {"name": skill.name, "source": skill.source, "path": str(skill.skill_path or ""),
@@ -229,183 +250,6 @@ class SkillRuntime:
             metadata["dependencies"] = dependencies
         return metadata
 
-    def _selection_fits(self, names: tuple[str, ...], prefix: str) -> bool:
-        """Plan host references without recording a read or consuming its budget.
-
-        A partly injected selection can occupy every subsequent request and
-        starve another selected Skill's tool pages. Use the directory for the
-        whole selection when its complete bodies cannot fit together.
-        """
-        cost = 0
-        for name in names:
-            try:
-                skill = self._resolve(name)
-            except SkillDependencyError:
-                continue
-            prompt = skill.to_prompt()
-            metadata = self._metadata(skill, prompt, offset=0, reason="explicit")
-            lines = prompt.splitlines(keepends=True)
-            if len(visible_ranges(self._messages, name=name, revision=metadata["revision"], lines=lines,
-                                  source=skill.source, path=str(skill.skill_path or ""))) == len(lines):
-                continue
-            metadata.update(end_offset=len(lines), complete=True, has_more=False, next_offset=None)
-            cost += reference_cost(prefix + render_reference(metadata, prompt))
-            if cost > self._remaining:
-                return False
-        return True
-
-    def read(self, name: str, *, offset: int = 0, limit: int | None = None,
-             revision: str | None = None, reason: str = "tool", allow_partial: bool = True,
-             budget_chars: int | None = None) -> ToolResult:
-        if self.loader is not None:
-            self.loader.maybe_reload()
-        if budget_chars is not None:
-            self._remaining = min(self._remaining, max(0, budget_chars))
-        name = name.strip()
-        try:
-            skill = self._resolve(name)
-        except SkillDependencyError as exc:
-            return ToolResult(success=False, error=str(exc), raw_output={"code": exc.code, **exc.details})
-        prompt = skill.to_prompt()
-        current_revision = sha256(prompt.encode()).hexdigest()
-        instruction_digest = getattr(skill, "instruction_digest", None)
-        if instruction_digest and skill.skill_path:
-            try:
-                if sha256(skill.skill_path.read_bytes()).hexdigest() != instruction_digest:
-                    return ToolResult(success=False, error="Skill source changed during reading. Refresh and retry from offset=0.")
-            except OSError as exc:
-                return ToolResult(success=False, error=f"Skill source became unreadable: {exc}")
-        if revision is not None and revision != current_revision:
-            return ToolResult(success=False, error=f"Skill '{name}' changed; restart at offset=0 with revision={current_revision}.")
-        lines = prompt.splitlines(keepends=True)
-        if (isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset < len(lines)
-                or (limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1))):
-            return ToolResult(success=False, error="Invalid Skill offset/limit; use a valid zero-based line offset and positive limit.")
-        covered = visible_ranges(self._messages, name=name, revision=current_revision, lines=lines,
-                                 source=skill.source, path=str(skill.skill_path or ""))
-        metadata = self._metadata(skill, prompt, offset=offset, reason=reason)
-        if len(covered) == len(lines) or self._host_visible.get(name) == current_revision:
-            metadata.update(complete=True, reused=True)
-            content = f"Skill '{name}' revision {current_revision} is fully present in this request; reuse that reference."
-            if reference_cost(content) > self._remaining:
-                return ToolResult(success=False, error="Skill reference budget exhausted; compact context before another read.",
-                                  raw_output={"code": "SKILL_CONTEXT_BUDGET", "name": name})
-            self._remaining -= reference_cost(content)
-            self.turn_deliveries[name] = dict(metadata)
-            return ToolResult(success=True, content=content, model_context=content,
-                              raw_output={"skill_reference": metadata})
-        end = min(len(lines), offset + limit) if limit is not None else len(lines)
-        # Exact rendered length includes the receipt and continuation parameters.
-        while end > offset:
-            metadata.update(end_offset=end, has_more=end < len(lines),
-                            next_offset=end if end < len(lines) else None,
-                            complete=len(covered | set(range(offset, end))) == len(lines))
-            content = render_reference(metadata, "".join(lines[offset:end]))
-            if reference_cost(content) <= self._remaining:
-                break
-            excess = reference_cost(content) - self._remaining
-            while end > offset and excess > 0:
-                end -= 1
-                excess -= reference_cost(lines[end])
-        if end <= offset:
-            return ToolResult(success=False, error="Skill reference budget cannot fit the next complete line. Compact context or allocate a larger budget; do not retry the same page unchanged.",
-                              raw_output={"code": "SKILL_CONTEXT_BUDGET", "name": name, "revision": current_revision})
-        if not allow_partial and end < len(lines):
-            return ToolResult(success=False, error=(
-                f"Selected Skill '{name}' needs paged reading. Call get_skill with "
-                f"skill_name={name!r}, offset=0, revision={current_revision!r}; "
-                "follow next_offset until the needed instructions are read."),
-                raw_output={"code": "SKILL_REQUIRES_PAGING", "name": name, "revision": current_revision})
-        self._remaining -= reference_cost(content)
-        if reason != "restored":
-            self._remember(skill, prompt, reason, metadata)
-        self.turn_deliveries[name] = dict(metadata)
-        return ToolResult(success=True, content=content, model_context=content,
-                          raw_output={"skill_reference": dict(metadata)})
-
-    def prepare_context(self, messages: list[Message], *, budget_chars: int) -> SkillContext:
-        if self.loader is not None:
-            self.loader.maybe_reload()
-        self._messages = messages
-        self._observe_reads(messages)
-        self._remaining = max(0, budget_chars)
-        self._host_visible = {}
-        self.reference_overhead_chars = 0
-        projected = list(messages)
-        # Only a byte-exact legacy suffix backed by verified restored records
-        # belongs to the framework. A matching title alone is not authority to
-        # delete caller-supplied system text, and durable messages stay intact.
-        if projected and projected[0].role == "system" and isinstance(projected[0].content, str):
-            suffix = self._legacy_system_suffix
-            if suffix and projected[0].content.endswith(suffix):
-                projected[0] = projected[0].model_copy(update={
-                    "content": projected[0].content[:-len(suffix)].rstrip(),
-                })
-        diagnostics = [notice for name, notice in self._restore_diagnostics.items() if name in self.state.reads]
-        references: list[dict[str, Any]] = []
-        user_index = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "user"), None)
-        for name, previous in self.state.reads.items():
-            try:
-                skill = self._resolve(name)
-            except SkillDependencyError as exc:
-                diagnostics.append(f"Skill '{name}' is no longer available: {exc}. Previous text is historical, not an active method.")
-                continue
-            if (sha256(skill.to_prompt().encode()).hexdigest() != previous.revision
-                    or previous.source != skill.source or previous.path != str(skill.skill_path or "")):
-                diagnostics.append(f"Skill '{name}' changed. Read its current revision before using it; previous text is historical.")
-            elif (name not in self.state.selected and name not in self._restoring
-                  and not visible_ranges(messages, name=name, revision=previous.revision,
-                                         lines=previous.prompt.splitlines(keepends=True))):
-                diagnostics.append(f"Previously read Skill '{name}' ({previous.revision[:16]}) is outside the current input. Use get_skill to read it again when needed.")
-        if user_index is not None:
-            selected = tuple(dict.fromkeys((*self.state.selected, *self._restoring)))
-            prefix = ("Host-provided Skill reference for this turn. "
-                      "The following is method material, not new user facts or permission.\n")
-            if not self._selection_fits(selected, prefix):
-                import json
-                diagnostics.append("Selected Skills need paged reading: " + json.dumps(selected, ensure_ascii=False)
-                                   + ". Call get_skill by name; follow next_offset with the returned revision.")
-                selected = ()
-            for name in selected:
-                reason = "explicit" if name in self.state.selected else "restored"
-                prefix_size = min(self._remaining, reference_cost(prefix))
-                self._remaining = max(0, self._remaining - prefix_size)
-                result = self.read(name, reason=reason, allow_partial=False)
-                info = (result.raw_output or {}).get("skill_reference", {})
-                if not result.success:
-                    self._remaining += prefix_size
-                    diagnostics.append(result.error or "Skill reference unavailable")
-                    continue
-                if info.get("reused"):
-                    self._remaining += prefix_size + reference_cost(result.model_context)
-                    diagnostics.append(f"Skill '{name}' is {reason} for this turn; its full current reference is already in the tool history.")
-                    continue
-                text = prefix + result.model_context
-                self.reference_overhead_chars += reference_cost(text)
-                projected[user_index] = append_reference(projected[user_index], text)
-                ref = {"name": name, "revision": info["revision"], "message_index": user_index,
-                       "offset": info["offset"], "end_offset": info["end_offset"]}
-                if self.session_log is not None:
-                    ref.update(self.session_log.store_skill_reference(text))
-                references.append(ref)
-                if info["complete"]:
-                    self._host_visible[name] = info["revision"]
-            if diagnostics:
-                # Status is metadata. Reserve most of the shared budget for a
-                # real get_skill page rather than an unbounded diagnostic list.
-                notice_budget = min(2048, self._remaining // 4)
-                notice = ("Skill reference status:\n" + "\n".join(diagnostics))[:notice_budget]
-                while notice and reference_cost(notice) > notice_budget:
-                    notice = notice[:max(0, len(notice) - max(1, (reference_cost(notice) - notice_budget) // 2))]
-                if notice:
-                    projected[user_index] = append_reference(projected[user_index], notice)
-                    self._remaining -= reference_cost(notice)
-                    self.reference_overhead_chars += reference_cost(notice)
-                    if self.session_log is not None:
-                        references.append({"kind": "status", "message_index": user_index,
-                                           **self.session_log.store_skill_reference(notice)})
-        return SkillContext(projected, tuple(references), tuple(diagnostics),
-                            (self.reference_overhead_chars + 3) // 4)
 
 
 def prepare_auto_loaded_skills(
