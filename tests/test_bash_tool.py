@@ -1742,6 +1742,40 @@ async def test_foreground_output_normal_size_no_raw_output():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout,stderr",
+    [("missing font source", ""), ("", "bad image"),
+     ("missing font source", "bad image"), ("same diagnostic", "same diagnostic"),
+     ("first diagnostic\n" + "x" * 12_000, "last diagnostic")],
+    ids=["stdout", "stderr", "both", "duplicate", "bounded"],
+)
+async def test_foreground_failure_exposes_both_streams_with_one_error_budget(stdout, stderr, tmp_path):
+    program = f"import sys; sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); sys.exit(7)"
+    script = tmp_path / "diagnostic.py"
+    script.write_text(program)
+    result = await BashTool(workspace_dir=str(tmp_path)).execute(
+        command=f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+    )
+    assert not result.success and result.exit_code == 7
+    assert len(result.error) <= 8_500
+    for diagnostic in (stdout.splitlines()[0] if stdout else "", stderr):
+        if diagnostic:
+            assert diagnostic in result.error
+    if stdout == stderr:
+        assert result.error.count(stdout) == 1
+    elif stdout and stderr:
+        assert "stdout:" in result.error and "stderr:" in result.error
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stream redirection")
+@pytest.mark.asyncio
+async def test_foreground_redirected_failure_keeps_diagnostic_and_exit_code():
+    result = await BashTool().execute(command="sh -c 'echo redirected-error >&2; exit 9' 2>&1")
+    assert not result.success and result.exit_code == 9
+    assert "redirected-error" in result.error
+
+
+@pytest.mark.asyncio
 async def test_foreground_large_stderr_failure_is_bounded_without_error_duplication():
     """A failing command with huge stderr keeps one shared bounded payload."""
     import platform

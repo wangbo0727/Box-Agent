@@ -67,6 +67,32 @@ class _EchoTool(Tool):
 
 
 @pytest.mark.asyncio
+async def test_failed_bash_stdout_diagnostic_reaches_next_model_turn(tmp_path):
+    from box_agent.tools.bash_tool import BashTool
+
+    class InspectNextTurn(_OneToolCallLLM):
+        observed = ""
+
+        async def generate_stream(self, messages, **kwargs):
+            if self._calls:
+                self.observed = "\n".join(str(m.content) for m in messages if m.role == "tool")
+            async for event in super().generate_stream(messages, **kwargs):
+                if event.tool_calls:
+                    event.tool_calls[0].function.arguments = {"command": "echo missing-font-source; exit 7"}
+                yield event
+
+    tool = BashTool(workspace_dir=str(tmp_path), non_interactive=True)
+    llm = InspectNextTurn(tool.name)
+    events = [event async for event in run_agent_loop(
+        llm=llm, messages=[Message(role="user", content="Run the check")],
+        tools={tool.name: tool}, max_steps=3, workspace_dir=str(tmp_path),
+    )]
+    assert "missing-font-source" in llm.observed
+    assert "exit code 7" in llm.observed
+    assert any(isinstance(event, ToolCallResult) and not event.success for event in events)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("parallel_safe", [False, True])
 async def test_declared_delivery_scope_guards_raw_results_and_discovery(tmp_path, parallel_safe):
     from box_agent.artifact_publication import write_metadata

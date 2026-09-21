@@ -1798,15 +1798,21 @@ Examples:
                         error_msg = f"Command failed with exit code {process.returncode}"
                         if dropped:
                             # Failed tool messages use ``error`` (not ``content``)
-                            # in model history. Keep a smaller bounded diagnostic
-                            # there so the model can still diagnose the failure
-                            # without duplicating the full 50K visible result.
-                            diagnostic, _ = _truncate_bash_output(
-                                stdout_text, "error context", limit=8_000
-                            )
+                            # in model history. Truncation already combined both
+                            # streams; do not append stderr a second time.
+                            context = stdout_text
+                        else:
+                            streams = []
+                            if stdout_text.strip():
+                                streams.append(f"stdout:\n{stdout_text.strip()}")
+                            if stderr_text.strip() and stderr_text.strip() != stdout_text.strip():
+                                streams.append(f"stderr:\n{stderr_text.strip()}")
+                            context = "\n".join(streams)
+                        diagnostic, _ = _truncate_bash_output(
+                            context, "error context", limit=8_000
+                        )
+                        if diagnostic.strip():
                             error_msg += f"\n{diagnostic.strip()}"
-                        elif stderr_text:
-                            error_msg += f"\n{stderr_text.strip()}"
 
                     return BashOutputResult(
                         success=is_success,
