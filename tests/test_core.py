@@ -4937,6 +4937,77 @@ async def test_failed_tool_persistence_content_is_saved_before_next_llm_call(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_steps, reminder_step", [(12, 3), (14, 5), (16, 7)])
+@pytest.mark.parametrize("ending", ["complete", "cancel", "step_limit", "tool_limit"])
+async def test_near_limit_reminder_allows_finishing_work_without_expanding_limits(
+    tmp_path, max_steps, reminder_step, ending,
+):
+    output = tmp_path / "result.txt"
+    responses = []
+    for step in range(1, max_steps + 1):
+        if step == reminder_step:
+            name, arguments = "write_file", {"path": str(output), "content": "Saved work"}
+        elif step == reminder_step + 1:
+            name, arguments = "read_file", {"path": str(output)}
+        elif step == reminder_step + 2 and ending != "step_limit":
+            responses.append(LLMResponse(content="Work saved and checked.", finish_reason="stop"))
+            break
+        else:
+            name, arguments = "echo", {"text": f"evidence-{step}"}
+        responses.append(LLMResponse(content="", finish_reason="tool", tool_calls=[
+            ToolCall(id=f"call-{step}", type="function", function=FunctionCall(
+                name=name, arguments=arguments,
+            )),
+        ]))
+    llm = CapturingStreamLLM(responses)
+    events = await collect(run_agent_loop(
+        llm=llm, messages=_msgs(),
+        tools={"echo": EchoTool(), "write_file": WriteTool(workspace_dir=str(tmp_path)),
+               "read_file": ReadTool(workspace_dir=str(tmp_path))},
+        max_steps=max_steps, max_tool_calls=reminder_step if ending == "tool_limit" else None,
+        workspace_dir=str(tmp_path),
+        is_cancelled=(lambda: output.exists()) if ending == "cancel" else None,
+    ))
+
+    reminders = [event for event in events if isinstance(event, InjectedMessageEvent)
+                 and "执行步数提醒" in event.content]
+    assert len(reminders) == 1
+    assert not reminders[0].user_visible
+    assert f"第 {reminder_step}/{max_steps} 步" in reminders[0].content
+    assert "剩余 10 步（含本轮）" in reminders[0].content
+    assert "必要的写入、检查和收尾" in reminders[0].content
+    assert "不增加工具、权限或任何预算" in reminders[0].content
+    assert "不得把中间结果称为最终完成" in reminders[0].content
+    assert "停止调用任何工具" not in reminders[0].content
+    assert not any("执行步数提醒" in str(message.content)
+                   for request in llm.message_calls[:reminder_step - 1] for message in request)
+    reminder = next(message for message in llm.message_calls[reminder_step - 1]
+                    if "执行步数提醒" in str(message.content))
+    assert reminder.source == "runtime"
+    assert "Runtime state update:" in reminder.content
+    assert "Mid-turn user message:" not in reminder.content
+    assert output.read_text() == "Saved work"
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    if ending == "cancel":
+        assert done.stop_reason == StopReason.CANCELLED
+        assert len(llm.message_calls) == reminder_step
+    elif ending == "step_limit":
+        assert done.stop_reason == StopReason.MAX_STEPS
+        assert len(llm.message_calls) == max_steps
+    else:
+        assert done.stop_reason == StopReason.END_TURN
+        check = next(event for event in events if isinstance(event, ToolCallResult)
+                     and event.tool_name == "read_file")
+        if ending == "tool_limit":
+            assert not check.success
+            assert "Total tool call budget reached" in check.error
+        else:
+            assert check.success
+            assert "Saved work" in check.content
+
+
+@pytest.mark.asyncio
 async def test_no_progress_breaker_injects_wrapup_and_stops():
     """After no_progress_limit consecutive failing steps, the breaker injects a
     synthesis nudge so the agent stops flailing instead of running to max_steps."""

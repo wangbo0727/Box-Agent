@@ -1353,9 +1353,8 @@ async def _run_agent_loop_impl(
         context_compacted = False
 
         # ── Near-limit wrap-up nudge (one-shot) ─────────────
-        # Reserve the final few steps for synthesis: stop further
-        # research and force a self-contained answer from gathered
-        # material before the step budget is exhausted.
+        # Prioritize necessary writes, checks, and synthesis within the
+        # remaining budget without changing hard limits or cancellation.
         if (
             not wrapup_injected
             and max_steps > wrapup_remaining_steps
@@ -1364,7 +1363,7 @@ async def _run_agent_loop_impl(
             wrapup_injected = True
             wrapup_text = near_limit_wrapup_text(step, max_steps)
             messages.append(
-                Message(role="user", source="runtime", content=format_injected_message(wrapup_text))
+                Message(role="user", source="runtime", content=format_runtime_context_update(wrapup_text))
             )
             yield InjectedMessageEvent(content=wrapup_text, injection_id=None, user_visible=False)
 

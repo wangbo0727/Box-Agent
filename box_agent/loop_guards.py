@@ -227,17 +227,17 @@ def search_files_empty_result_guidance(limit: int) -> str:
 
 
 def near_limit_wrapup_text(step: int, max_steps: int) -> str:
-    """Reserve the final steps for synthesis: stop gathering, answer now.
+    """Prioritize finishing current work within the remaining hard limits.
 
     ``step`` is the 0-based loop index (as in ``run_agent_loop``).
     """
     remaining = max_steps - step
     return (
-        f"⚠️ 步数预算即将用尽（已到第 {step + 1}/{max_steps} 步，约剩 {remaining} 步）。"
-        "现在请停止调用任何工具、停止继续搜索或探索。"
-        "仅基于你已经收集到的信息，在本轮直接给出完整、可独立阅读的最终答案/总结："
-        "包含关键结论、数据、以及已产出的文件路径；若有未覆盖的缺口，简要标注即可，"
-        "不要再去调查。"
+        f"执行步数提醒：当前第 {step + 1}/{max_steps} 步，"
+        f"剩余 {remaining} 步（含本轮）。这不是用户的停止指令，也不表示工具额度已耗尽。"
+        "请停止扩展新的探索，优先利用仍可用的额度完成当前任务必要的写入、检查和收尾。"
+        "本提醒不增加工具、权限或任何预算；已有硬限制和用户取消指令仍然有效。"
+        "若无法完成，保存已完成工作并明确列出未完成项，不得把中间结果称为最终完成。"
     )
 
 

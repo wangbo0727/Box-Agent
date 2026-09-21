@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
@@ -11,9 +12,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import tiktoken
 
-from box_agent.events import DoneEvent, StopReason, SubAgentEvent, WebSearchEvent
+from box_agent.config import ToolLimitsConfig
+from box_agent.events import DoneEvent, StepStart, StopReason, SubAgentEvent, WebSearchEvent
 from box_agent.context_resources import ResourceDescriptor
-from box_agent.schema import LLMResponse, Message, StreamEvent, TokenUsage
+from box_agent.schema import FunctionCall, LLMResponse, Message, StreamEvent, TokenUsage, ToolCall
 from box_agent.agent import Agent
 from box_agent.session_log import SessionLog
 from box_agent.tools.base import Tool, ToolResult
@@ -320,6 +322,74 @@ def test_description_explains_flat_contract_and_derived_policy():
     assert "Never pass a serialized JSON string" in parameters["budget"]["description"]
     assert "disjoint scopes" in parameters["write_scope"]["description"]
     assert "general agent loop" in parameters["files"]["description"]
+
+
+def test_budget_help_uses_current_configured_defaults_and_caps():
+    limits = ToolLimitsConfig(sub_agent={"general_max_steps": 20, "general_max_tool_calls": 30})
+    tool = SubAgentTool(llm=AsyncMock(), parent_tools={}, tool_limits=limits)
+    budget_schema = tool.parameters["properties"]["budget"]
+    help_text = budget_schema["description"]
+
+    assert help_text in tool.description
+    assert "runtime defaults: max_steps=20, max_tool_calls=30" in help_text
+    assert "current caps are max_steps=20, max_tool_calls=30" in help_text
+    assert "Omit" in help_text
+    assert "omitted fields inherit defaults" in help_text
+    assert "clamped" in help_text
+    assert "one-step/file-count" in help_text
+    assert "max_steps:12" not in tool.description
+    assert "max_tool_calls:25" not in tool.description
+    assert "budget" not in tool.parameters["required"]
+    assert all("maximum" not in field for field in budget_schema["properties"].values())
+
+
+@pytest.mark.parametrize("budget, expected", [
+    (None, {"max_steps": 20, "max_tool_calls": 30}),
+    ({}, {"max_steps": 20, "max_tool_calls": 30}),
+    ({"max_steps": 7}, {"max_steps": 7, "max_tool_calls": 30}),
+    ({"max_tool_calls": 9}, {"max_steps": 20, "max_tool_calls": 9}),
+    ({"max_steps": 7, "max_tool_calls": 9}, {"max_steps": 7, "max_tool_calls": 9}),
+    ({"max_steps": 99, "max_tool_calls": 99}, {"max_steps": 20, "max_tool_calls": 30}),
+])
+async def test_configured_budget_matches_child_prompt_execution_and_receipt(tmp_path, budget, expected):
+    requests = []
+
+    class ReadingLLM:
+        async def generate_stream(self, *, messages, **kwargs):
+            requests.append([message.model_copy(deep=True) for message in messages])
+            step = len(requests)
+            yield StreamEvent(type="finish", finish_reason="tool_use", tool_calls=[
+                ToolCall(id=f"read-{step}-{index}", type="function", function=FunctionCall(
+                    name="read_file", arguments={"path": str(tmp_path / f"input-{step}-{index}.txt")},
+                )) for index in range(2)
+            ])
+
+    for step in range(1, 21):
+        for index in range(2):
+            (tmp_path / f"input-{step}-{index}.txt").write_text(f"Evidence {step}/{index}")
+    queue = asyncio.Queue()
+    tool = SubAgentTool(
+        llm=ReadingLLM(), parent_tools={"read_file": ReadTool(workspace_dir=str(tmp_path))},
+        workspace_dir=str(tmp_path), no_progress_limit=0,
+        tool_limits=ToolLimitsConfig(sub_agent={"general_max_steps": 20, "general_max_tool_calls": 30}),
+    )
+    arguments = {} if budget is None else {"budget": budget}
+    result = await tool.execute(task="Read available evidence", required_tools=["read_file"],
+                                _event_queue=queue, **arguments)
+
+    assert result.success, result.error
+    assert result.raw_output["budget"] == expected
+    assert f"Budget: `{json.dumps(expected, sort_keys=True)}`" in requests[0][0].content
+    assert len(requests) == expected["max_steps"]
+    assert result.raw_output["model_calls"] == expected["max_steps"]
+    assert result.raw_output["tool_calls"] == min(2 * expected["max_steps"], expected["max_tool_calls"])
+    child_steps = []
+    while not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, SubAgentEvent) and isinstance(event.event, StepStart):
+            child_steps.append(event.event)
+    assert len(child_steps) == expected["max_steps"]
+    assert all(event.max_steps == expected["max_steps"] for event in child_steps)
 
 
 # ── Tool filtering ───────────────────────────────────────────
@@ -1044,8 +1114,8 @@ async def test_invalid_budget_string_returns_object_correction_example():
     assert result.raw_output["code"] == "INVALID_DELEGATION_SPEC"
     assert result.raw_output["invalid_fields"] == ["budget"]
     assert result.raw_output["field_corrections"]["budget"] == {
-        "message": "Pass budget as a JSON object, never as a JSON string.",
-        "example": {"max_steps": 12, "max_tool_calls": 25},
+        "message": "Omit budget to use runtime defaults, or pass it as a JSON object, never as a JSON string.",
+        "example": {},
     }
     llm.generate_stream.assert_not_called()
 

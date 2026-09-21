@@ -309,6 +309,35 @@ def test_budget_uses_configured_caps_and_rejects_serialized_json() -> None:
     assert parsed.budget.to_dict() == {"max_steps": 20, "max_tool_calls": 30}
     assert isinstance(serialized, CapabilityFailure)
     assert serialized.invalid_fields == ("budget",)
+    correction = serialized.to_dict()["field_corrections"]["budget"]
+    assert correction["example"] == {}
+    assert "Omit budget" in correction["message"]
+
+
+@pytest.mark.parametrize("budget, expected", [
+    (None, {"max_steps": 20, "max_tool_calls": 30}),
+    ({}, {"max_steps": 20, "max_tool_calls": 30}),
+    ({"max_steps": 7}, {"max_steps": 7, "max_tool_calls": 30}),
+    ({"max_tool_calls": 9}, {"max_steps": 20, "max_tool_calls": 9}),
+    ({"max_steps": 7, "max_tool_calls": 9}, {"max_steps": 7, "max_tool_calls": 9}),
+    ({"max_steps": 99, "max_tool_calls": 99}, {"max_steps": 20, "max_tool_calls": 30}),
+])
+def test_general_budget_inherits_and_clamps_current_config(budget, expected):
+    parsed = _parse(budget=budget, general_max_steps=20, general_max_tool_calls=30)
+
+    assert isinstance(parsed, DelegationSpec)
+    assert parsed.strategy == "general_loop"
+    assert parsed.budget.to_dict() == expected
+
+
+@pytest.mark.parametrize("budget", [None, {}, {"max_steps": 99, "max_tool_calls": 99}])
+def test_file_batch_budget_keeps_one_step_and_file_count_with_custom_config(budget):
+    parsed = _parse(files=["a.md", "b.md"], required_tools=["read_file"], budget=budget,
+                    general_max_steps=20, general_max_tool_calls=30)
+
+    assert isinstance(parsed, DelegationSpec)
+    assert parsed.strategy == "batch_files"
+    assert parsed.budget.to_dict() == {"max_steps": 1, "max_tool_calls": 2}
 
 
 def test_recursive_sub_agent_tool_is_rejected() -> None:

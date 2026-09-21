@@ -428,6 +428,20 @@ class SubAgentTool(EventEmittingTool):
     def name(self) -> str:
         return "sub_agent"
 
+    def _budget_help(self) -> str:
+        limits = self._tool_limits.sub_agent
+        return (
+            "Optional budget for ordinary delegated tasks. Omit it to use the current "
+            f"runtime defaults: max_steps={limits.general_max_steps}, "
+            f"max_tool_calls={limits.general_max_tool_calls}. "
+            f"The current caps are max_steps={limits.general_max_steps}, "
+            f"max_tool_calls={limits.general_max_tool_calls}. "
+            "Explicit values narrow this task; omitted fields inherit defaults and "
+            "requests above the caps are clamped. File-only batch tasks keep their "
+            "separate one-step/file-count limits. Pass `budget` as an object (JSON object). "
+            "Never pass a serialized JSON string."
+        )
+
     @property
     def description(self) -> str:
         return (
@@ -451,8 +465,8 @@ class SubAgentTool(EventEmittingTool):
             "For the same read-only operation over known local text files, pass their paths in "
             "`files` and `required_tools:[\"read_file\"]` to use the bounded "
             "completeness-checked batch fast path. Omitted tools with files and a one-step "
-            "budget also retain that path when no write_scope is given. Pass "
-            "`budget` as an object such as `{max_steps:12, max_tool_calls:25}`."
+            "budget also retain that path when no write_scope is given.\n\n"
+            f"{self._budget_help()}"
         )
 
     @property
@@ -529,11 +543,7 @@ class SubAgentTool(EventEmittingTool):
                 },
                 "budget": {
                     "type": "object",
-                    "description": (
-                        "Optional numeric limits as a JSON object, for example "
-                        "{\"max_steps\":12,\"max_tool_calls\":25}. Never pass a "
-                        "serialized JSON string."
-                    ),
+                    "description": self._budget_help(),
                     "properties": {
                         "max_steps": {"type": "integer", "minimum": 1},
                         "max_tool_calls": {"type": "integer", "minimum": 1},

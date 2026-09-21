@@ -200,8 +200,8 @@ class CapabilityFailure:
             field_corrections: dict[str, Any] = {}
             if any(field == "budget" or field.startswith("budget.") for field in self.invalid_fields):
                 field_corrections["budget"] = {
-                    "message": "Pass budget as a JSON object, never as a JSON string.",
-                    "example": {"max_steps": 12, "max_tool_calls": 25},
+                    "message": "Omit budget to use runtime defaults, or pass it as a JSON object, never as a JSON string.",
+                    "example": {},
                 }
             if any(
                 field == "write_scope" or field.startswith("write_scope[")

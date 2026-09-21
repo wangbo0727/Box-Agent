@@ -298,7 +298,7 @@ async def test_runtime_wrapup_survives_interruption_before_model_response(
 
     root = tmp_path / "sessions"
     log = SessionLog.create(root, session_id="wrapup-checkpoint", cwd=tmp_path)
-    marker = "步数预算即将用尽" if nudge == "near_limit" else "没有取得有效进展"
+    marker = "执行步数提醒" if nudge == "near_limit" else "没有取得有效进展"
     recovered = []
     expected = []
 
@@ -316,8 +316,13 @@ async def test_runtime_wrapup_survives_interruption_before_model_response(
         snapshot.write_bytes(log.path.read_bytes())
         reopened = SessionLog.open(snapshot_root, session_id="wrapup-checkpoint", cwd=tmp_path)
         try:
-            recovered.extend(message.content for message in reopened.replay().messages
-                             if marker in str(message.content))
+            restored_reminders = [message for message in reopened.replay().messages
+                                  if marker in str(message.content)]
+            recovered.extend(message.content for message in restored_reminders)
+            assert all(message.source == "runtime" for message in restored_reminders)
+            if nudge == "near_limit":
+                assert all("Runtime state update:" in message.content for message in restored_reminders)
+                assert all("Mid-turn user message:" not in message.content for message in restored_reminders)
         finally:
             reopened.close()
         raise Interrupted
@@ -547,6 +552,61 @@ async def test_compaction_is_durable_before_live_context_switch(tmp_path):
         for event in log.events
     )
     log.close()
+
+
+@pytest.mark.asyncio
+async def test_near_limit_reminder_keeps_runtime_source_after_compaction_and_reopen(tmp_path):
+    from box_agent.tools.file_tools import ReadTool
+
+    root = tmp_path / "sessions"
+    log = SessionLog.create(root, session_id="compacted-reminder", cwd=tmp_path)
+    source = tmp_path / "input.txt"
+    source.write_text("Current task evidence")
+    requests = []
+
+    class Provider:
+        model = "test-model"
+        max_output_tokens = 1024
+
+        async def generate_stream(self, *, messages, **kwargs):
+            requests.append([message.model_copy(deep=True) for message in messages])
+            if len(requests) == 1:
+                agent.messages.extend(
+                    Message(role="user" if index % 2 == 0 else "assistant",
+                            content=f"history-{index}:" + "x" * 2000)
+                    for index in range(24)
+                )
+                yield StreamEvent(type="finish", finish_reason="tool", tool_calls=[
+                    ToolCall(id="read-evidence", type="function", function=FunctionCall(
+                        name="read_file", arguments={"path": str(source)},
+                    )),
+                ])
+            else:
+                yield StreamEvent(type="text", delta="Evidence checked.")
+                yield StreamEvent(type="finish", finish_reason="stop")
+
+    agent = Agent(
+        llm_client=Provider(), tools=[ReadTool(workspace_dir=str(tmp_path))], system_prompt="system",
+        workspace_dir=str(tmp_path), deferred_mcp_loading_enabled=False, session_log=log,
+        max_steps=11, token_limit=8000,
+    )
+    agent.add_user_message("Complete the current task")
+    options = replace(agent.default_run_options(), summary_llm=_SummaryCheckpointLLM(log.path))
+    events = [event async for event in agent.run_events(options=options)]
+    assert any(isinstance(event, SummarizationEvent) for event in events)
+    assert len(requests) == 2
+    log.close()
+
+    reopened = SessionLog.open(root, session_id="compacted-reminder", cwd=tmp_path)
+    try:
+        for messages in (requests[-1], reopened.replay().messages):
+            reminders = [message for message in messages if "执行步数提醒" in str(message.content)]
+            assert len(reminders) == 1
+            assert reminders[0].source == "runtime"
+            assert "Runtime state update:" in reminders[0].content
+            assert "Mid-turn user message:" not in reminders[0].content
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio
